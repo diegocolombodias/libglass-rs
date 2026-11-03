@@ -22,6 +22,12 @@ pub enum Error {
     UnknownNode(String),
     /// The operation needs one specific node, not a group such as `EVERYBODY_ID`.
     InvalidTarget(u32),
+    /// The sender of a [`Stream`](crate::Stream) transfer gave up on it.
+    TransferAborted,
+    /// A [`SharedRegion`](crate::SharedRegion) cannot have this size or offset.
+    InvalidSize(usize),
+    /// This plugin id is reserved for the library.
+    InvalidPluginId(u16),
 }
 
 /// Result type of this library.
@@ -40,6 +46,9 @@ impl fmt::Display for Error {
             Error::Decode => write!(f, "could not decode data"),
             Error::UnknownNode(nick) => write!(f, "unknown node: {nick}"),
             Error::InvalidTarget(id) => write!(f, "{id:#x} is not a single node"),
+            Error::TransferAborted => write!(f, "the sender aborted the transfer"),
+            Error::InvalidSize(size) => write!(f, "invalid size: {size}"),
+            Error::InvalidPluginId(id) => write!(f, "plugin id {id} is reserved"),
         }
     }
 }

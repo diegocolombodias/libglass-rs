@@ -99,6 +99,11 @@ pub enum RootMsg {
     PeerListUpdate(LinkKind, PeerAddr),
     /// Answer to `PeerStart`: your id is taken, use this one.
     PeerChangeId(LinkKind, NodeId),
+    /// Client to server, through both the connection and UDP, to link the two.
+    /// This one and `UdpReady` do not exist in the C++ library.
+    UdpRegister(u64),
+    /// Server to client: did it work?
+    UdpReady(bool),
 }
 
 impl RootMsg {
@@ -132,6 +137,12 @@ impl RootMsg {
             }
             RootMsg::QuitAll => vec![4],
             RootMsg::Bye => vec![5],
+            RootMsg::UdpRegister(token) => {
+                let mut out = vec![6];
+                out.extend_from_slice(&token.to_be_bytes());
+                out
+            }
+            RootMsg::UdpReady(accepted) => vec![7, *accepted as u8],
             RootMsg::PeerStart(kind, addr) => encode_link_addr(*kind, LINK_START, addr),
             RootMsg::PeerListUpdate(kind, addr) => encode_link_addr(*kind, LINK_LIST_UPDATE, addr),
             RootMsg::PeerList(kind, peers) => {
@@ -184,6 +195,18 @@ impl RootMsg {
             )),
             4 => Ok(RootMsg::QuitAll),
             5 => Ok(RootMsg::Bye),
+            6 => {
+                let token = bytes
+                    .get(1..9)
+                    .ok_or(Error::InvalidPacket("truncated token"))?;
+                Ok(RootMsg::UdpRegister(u64::from_be_bytes(
+                    token.try_into().unwrap(),
+                )))
+            }
+            7 => match bytes.get(1) {
+                Some(&accepted) => Ok(RootMsg::UdpReady(accepted != 0)),
+                None => Err(Error::InvalidPacket("truncated UDP answer")),
+            },
             PEER_BASE..=115 => decode_link_message(bytes, kind),
             _ => Err(Error::InvalidPacket("unknown root message")),
         }
@@ -469,6 +492,51 @@ impl RemoteMsg {
     }
 }
 
+/// Messenger plugin messages. The C++ plugin is not part of its build, and cannot
+/// be compiled anymore, so there is no format to be compatible with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessengerMsg {
+    CreateLocal(String),
+    CreateGlobal(String),
+    Delete(String),
+    /// `[kind][name\0][target: u32][data]`.
+    Message {
+        name: String,
+        target: NodeId,
+        data: Vec<u8>,
+    },
+}
+
+impl MessengerMsg {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            MessengerMsg::CreateLocal(name) => encode_named(b'C', name, &[]),
+            MessengerMsg::CreateGlobal(name) => encode_named(b'G', name, &[]),
+            MessengerMsg::Delete(name) => encode_named(b'D', name, &[]),
+            MessengerMsg::Message { name, target, data } => {
+                let mut content = target.to_be_bytes().to_vec();
+                content.extend_from_slice(data);
+                encode_named(b'M', name, &content)
+            }
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<MessengerMsg> {
+        let (kind, name, data) = decode_named(bytes)?;
+        match kind {
+            b'C' => Ok(MessengerMsg::CreateLocal(name)),
+            b'G' => Ok(MessengerMsg::CreateGlobal(name)),
+            b'D' => Ok(MessengerMsg::Delete(name)),
+            b'M' => Ok(MessengerMsg::Message {
+                name,
+                target: read_u32(data, 0)?,
+                data: data[4..].to_vec(),
+            }),
+            _ => Err(Error::InvalidPacket("unknown messenger message")),
+        }
+    }
+}
+
 /// `NOBODY_ID` means that no client is the master.
 pub const NO_MASTER: NodeId = NOBODY_ID;
 
@@ -631,6 +699,34 @@ mod tests {
         assert_eq!(value.encode(), [4, b'r', 0, 7]);
         assert_eq!(RemoteMsg::decode(&value.encode()).unwrap(), value);
         assert!(RemoteMsg::decode(&[9, b'r', 0]).is_err());
+    }
+
+    #[test]
+    fn messenger_and_udp_messages_round_trip() {
+        for msg in [
+            MessengerMsg::CreateLocal("m".into()),
+            MessengerMsg::CreateGlobal("m".into()),
+            MessengerMsg::Delete("m".into()),
+            MessengerMsg::Message {
+                name: "m".into(),
+                target: 7,
+                data: vec![0, 1],
+            },
+        ] {
+            assert_eq!(MessengerMsg::decode(&msg.encode()).unwrap(), msg);
+        }
+        assert!(MessengerMsg::decode(&[b'M', b'm', 0, 1]).is_err());
+        assert!(MessengerMsg::decode(&[b'X', b'm', 0]).is_err());
+
+        for msg in [
+            RootMsg::UdpRegister(0x0102030405060708),
+            RootMsg::UdpReady(true),
+            RootMsg::UdpReady(false),
+        ] {
+            assert_eq!(RootMsg::decode(&msg.encode()).unwrap(), msg);
+        }
+        assert!(RootMsg::decode(&[6, 1, 2]).is_err());
+        assert!(RootMsg::decode(&[7]).is_err());
     }
 
     #[test]

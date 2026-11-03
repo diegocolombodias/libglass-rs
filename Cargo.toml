@@ -6,4 +6,14 @@ description = "Glass - a distributed computing library (Rust port of the C++ lib
 license = "LGPL-2.1-or-later"
 
 [dependencies]
+bincode = { version = "1", optional = true }
 log = "0.4"
+memmap2 = "0.9"
+serde = { version = "1", optional = true }
+
+[features]
+# Adds `Serde<T>`, to send any type that implements serde's traits.
+serde = ["dep:serde", "dep:bincode"]
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

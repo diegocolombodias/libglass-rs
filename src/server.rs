@@ -3,18 +3,25 @@ use crate::barrier::BarrierServer;
 use crate::conn::Conn;
 use crate::error::{Error, Result};
 use crate::event::EventServer;
+use crate::messenger::MessengerServer;
 use crate::outbound::Outbound;
 use crate::owners::{Links, Relation, Source};
 use crate::packet::Packet;
+use crate::plugin::{self, ServerPlugin, MAX_RESERVED_PLUGIN_ID};
 use crate::protocol::{PeerAddr, RootMsg, NO_MASTER};
 use crate::remote::RemoteServer;
 use crate::shared::SharedServer;
+use crate::transport::{Listener, Stream};
 use crate::types::*;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::net::Ipv4Addr;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +32,9 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CLIENTS: NodeId = 0xFFFF;
+const UDP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The largest UDP payload. Whatever is larger goes through the stream.
+pub(crate) const MAX_DATAGRAM_SIZE: usize = 65507;
 
 type ConnId = u64;
 
@@ -41,13 +51,17 @@ enum Incoming {
         announce: bool,
     },
     Packet(ConnId, Packet),
+    Datagram(SocketAddr, Packet),
     Closed(ConnId),
+    AddPlugin(PluginId, Box<dyn ServerPlugin>),
     Stop,
 }
 
 struct Client {
     conn: Arc<Conn>,
     nickname: String,
+    /// Where to send unreliable packets, if the client asked for them.
+    udp: Option<SocketAddr>,
 }
 
 /// What this server knows about another server it is connected to.
@@ -67,6 +81,7 @@ struct Directory {
     clients: BTreeMap<NodeId, Client>,
     links: BTreeMap<NodeId, Link>,
     master: NodeId,
+    plugin_ids: BTreeSet<PluginId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,12 +115,29 @@ pub struct GlassServer {
     tx: Sender<Incoming>,
     accept_thread: Option<JoinHandle<()>>,
     dispatch_thread: Option<JoinHandle<()>>,
+    udp_thread: Option<JoinHandle<()>>,
+    datagrams: Arc<AtomicU64>,
+    #[cfg(unix)]
+    unix_path: Option<PathBuf>,
+}
+
+struct Options<'a> {
+    role: Role,
+    seed: Option<&'a str>,
+    udp: bool,
 }
 
 impl GlassServer {
     /// Starts a server. Use port 0 to let the system choose a free port.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<GlassServer> {
-        GlassServer::start(addr, Role::Standalone, None)
+        GlassServer::start_tcp(addr, Role::Standalone, None, false)
+    }
+
+    /// Starts a server that also accepts unreliable packets through UDP, on the
+    /// same port number, from clients that use
+    /// [`GlassClient::connect_with_udp`](crate::GlassClient::connect_with_udp).
+    pub fn bind_with_udp<A: ToSocketAddrs>(addr: A) -> Result<GlassServer> {
+        GlassServer::start_tcp(addr, Role::Standalone, None, true)
     }
 
     /// Starts a server that works together with others as a group: clients of
@@ -115,7 +147,17 @@ impl GlassServer {
     /// tells this one about the others, and they all connect to each other. If
     /// the seed cannot be reached, this server starts as the first of a group.
     pub fn bind_peer<A: ToSocketAddrs>(addr: A, seed: Option<&str>) -> Result<GlassServer> {
-        GlassServer::start(addr, Role::Peer, seed)
+        GlassServer::start_tcp(addr, Role::Peer, seed, false)
+    }
+
+    /// Like [`bind_peer`](Self::bind_peer), and it accepts UDP from its clients
+    /// like [`bind_with_udp`](Self::bind_with_udp). Between servers, packets
+    /// always go through TCP.
+    pub fn bind_peer_with_udp<A: ToSocketAddrs>(
+        addr: A,
+        seed: Option<&str>,
+    ) -> Result<GlassServer> {
+        GlassServer::start_tcp(addr, Role::Peer, seed, true)
     }
 
     /// Starts a peer that is also a gateway between groups.
@@ -123,13 +165,51 @@ impl GlassServer {
     /// Peers join its group with [`bind_peer`](Self::bind_peer). `seed` is the
     /// address of any gateway of another group.
     pub fn bind_remote_peer<A: ToSocketAddrs>(addr: A, seed: Option<&str>) -> Result<GlassServer> {
-        GlassServer::start(addr, Role::RemotePeer, seed)
+        GlassServer::start_tcp(addr, Role::RemotePeer, seed, false)
     }
 
-    fn start<A: ToSocketAddrs>(addr: A, role: Role, seed: Option<&str>) -> Result<GlassServer> {
+    /// Starts a server on a Unix socket, for clients on the same machine that
+    /// use [`GlassClient::connect_unix`](crate::GlassClient::connect_unix).
+    ///
+    /// A socket left behind by a server that has died is replaced, but any other
+    /// kind of file at that path is an error. The socket is removed when the
+    /// server is dropped.
+    #[cfg(unix)]
+    pub fn bind_unix<P: AsRef<Path>>(path: P) -> Result<GlassServer> {
+        use std::os::unix::fs::FileTypeExt;
+        let path = path.as_ref();
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.file_type().is_socket() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let options = Options {
+            role: Role::Standalone,
+            seed: None,
+            udp: false,
+        };
+        let mut server = GlassServer::start(Listener::Unix(listener), addr, options)?;
+        server.unix_path = Some(path.to_owned());
+        Ok(server)
+    }
+
+    fn start_tcp<A: ToSocketAddrs>(
+        addr: A,
+        role: Role,
+        seed: Option<&str>,
+        udp: bool,
+    ) -> Result<GlassServer> {
         let listener = TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
+        let options = Options { role, seed, udp };
+        GlassServer::start(Listener::Tcp(listener), addr, options)
+    }
+
+    fn start(listener: Listener, addr: SocketAddr, options: Options) -> Result<GlassServer> {
+        let Options { role, seed, udp } = options;
+        listener.set_nonblocking()?;
 
         let directory = Arc::new(Mutex::new(Directory::default()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -147,10 +227,21 @@ impl GlassServer {
         };
         if let Some(seed) = seed {
             match connect_any(seed) {
-                Ok(stream) => join(stream, kind, &mut id, addr, &tx, &next_conn)?,
+                Ok(stream) => join(Stream::Tcp(stream), kind, &mut id, addr, &tx, &next_conn)?,
                 Err(e) => log::warn!("could not reach seed {seed}, starting a new group: {e}"),
             }
         }
+
+        let udp_socket = udp
+            .then(|| UdpSocket::bind(addr).map(Arc::new))
+            .transpose()?;
+        let datagrams = Arc::new(AtomicU64::new(0));
+        let udp_thread = udp_socket.clone().map(|socket| {
+            let tx = tx.clone();
+            let stop = stop.clone();
+            let datagrams = datagrams.clone();
+            thread::spawn(move || udp_loop(socket, tx, stop, datagrams))
+        });
 
         let accept_thread = {
             let tx = tx.clone();
@@ -171,6 +262,11 @@ impl GlassServer {
                 barrier: BarrierServer::default(),
                 alias: AliasServer::default(),
                 remote: RemoteServer::default(),
+                messenger: MessengerServer::default(),
+                plugins: BTreeMap::new(),
+                udp: udp_socket,
+                udp_tokens: BTreeMap::new(),
+                udp_addrs: BTreeMap::new(),
                 quit: false,
             };
             let stop = stop.clone();
@@ -187,10 +283,35 @@ impl GlassServer {
             tx,
             accept_thread: Some(accept_thread),
             dispatch_thread: Some(dispatch_thread),
+            udp_thread,
+            datagrams,
+            #[cfg(unix)]
+            unix_path: None,
         })
     }
 
-    /// The address this server is listening on.
+    /// Adds a plugin, which gets the packets clients send with
+    /// [`GlassClient::send_to_plugin`](crate::GlassClient::send_to_plugin).
+    /// Ids up to [`MAX_RESERVED_PLUGIN_ID`] are reserved for the library.
+    pub fn add_plugin<P: ServerPlugin + 'static>(&self, id: PluginId, plugin: P) -> Result<()> {
+        if id <= MAX_RESERVED_PLUGIN_ID {
+            return Err(Error::InvalidPluginId(id));
+        }
+        if !self.directory.lock().unwrap().plugin_ids.insert(id) {
+            return Err(Error::AlreadyExists(format!("plugin {id}")));
+        }
+        self.tx
+            .send(Incoming::AddPlugin(id, Box::new(plugin)))
+            .map_err(|_| Error::Disconnected)
+    }
+
+    /// How many UDP packets this server has received.
+    pub fn datagrams_received(&self) -> u64 {
+        self.datagrams.load(Ordering::SeqCst)
+    }
+
+    /// The address this server is listening on. On a Unix socket, it has no
+    /// meaning.
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -251,6 +372,13 @@ impl Drop for GlassServer {
         if let Some(thread) = self.dispatch_thread.take() {
             let _ = thread.join();
         }
+        if let Some(thread) = self.udp_thread.take() {
+            let _ = thread.join();
+        }
+        #[cfg(unix)]
+        if let Some(path) = &self.unix_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -291,7 +419,7 @@ fn advertised_addr(listen: SocketAddr, conn: &Conn) -> PeerAddr {
 /// Joins a group through a server of it, then connects to the others found. On
 /// return, `id` is this server's final id.
 fn join(
-    stream: TcpStream,
+    stream: Stream,
     kind: LinkKind,
     id: &mut NodeId,
     listen: SocketAddr,
@@ -368,7 +496,7 @@ fn dial(
             return;
         }
     };
-    let (conn, reader) = match Conn::new(stream) {
+    let (conn, reader) = match Conn::new(Stream::Tcp(stream)) {
         Ok(pair) => pair,
         Err(e) => {
             log::warn!("could not set up connection to peer {id:#x}: {e}");
@@ -390,18 +518,17 @@ fn dial(
 }
 
 fn accept_loop(
-    listener: TcpListener,
+    listener: Listener,
     tx: Sender<Incoming>,
     stop: Arc<AtomicBool>,
     next_conn: Arc<AtomicU64>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, peer)) => {
-                log::debug!("connection from {peer}");
+            Ok(stream) => {
                 let id = next_conn.fetch_add(1, Ordering::SeqCst);
                 if let Err(e) = start_connection(stream, id, &tx) {
-                    log::warn!("could not set up connection from {peer}: {e}");
+                    log::warn!("could not set up a connection: {e}");
                 }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL_INTERVAL),
@@ -413,9 +540,7 @@ fn accept_loop(
     }
 }
 
-fn start_connection(stream: TcpStream, id: ConnId, tx: &Sender<Incoming>) -> Result<()> {
-    // Accepted sockets inherit non-blocking mode from the listener on Windows.
-    stream.set_nonblocking(false)?;
+fn start_connection(stream: Stream, id: ConnId, tx: &Sender<Incoming>) -> Result<()> {
     let (conn, reader) = Conn::new(stream)?;
     if tx.send(Incoming::Accepted(id, conn)).is_err() {
         return Err(Error::Disconnected);
@@ -425,7 +550,35 @@ fn start_connection(stream: TcpStream, id: ConnId, tx: &Sender<Incoming>) -> Res
     Ok(())
 }
 
-fn read_loop(mut reader: TcpStream, id: ConnId, tx: Sender<Incoming>) {
+fn udp_loop(
+    socket: Arc<UdpSocket>,
+    tx: Sender<Incoming>,
+    stop: Arc<AtomicBool>,
+    datagrams: Arc<AtomicU64>,
+) {
+    if let Err(e) = socket.set_read_timeout(Some(UDP_POLL_INTERVAL)) {
+        log::error!("could not set up UDP: {e}");
+        return;
+    }
+    let mut buffer = vec![0u8; MAX_DATAGRAM_SIZE + 1];
+    while !stop.load(Ordering::SeqCst) {
+        let (size, from) = match socket.recv_from(&mut buffer) {
+            Ok(received) => received,
+            Err(_) => continue,
+        };
+        datagrams.fetch_add(1, Ordering::SeqCst);
+        match Packet::decode(&buffer[..size]) {
+            Ok(packet) => {
+                if tx.send(Incoming::Datagram(from, packet)).is_err() {
+                    return;
+                }
+            }
+            Err(e) => log::debug!("ignoring invalid datagram from {from}: {e}"),
+        }
+    }
+}
+
+fn read_loop(mut reader: Stream, id: ConnId, tx: Sender<Incoming>) {
     loop {
         match Packet::read_from(&mut reader) {
             Ok(Some(packet)) => {
@@ -455,6 +608,12 @@ struct Dispatcher {
     barrier: BarrierServer,
     alias: AliasServer,
     remote: RemoteServer,
+    messenger: MessengerServer,
+    plugins: BTreeMap<PluginId, Box<dyn ServerPlugin>>,
+    udp: Option<Arc<UdpSocket>>,
+    /// Tokens clients have announced, waiting for their first datagram.
+    udp_tokens: BTreeMap<u64, ConnId>,
+    udp_addrs: BTreeMap<SocketAddr, ConnId>,
     quit: bool,
 }
 
@@ -479,7 +638,11 @@ impl Dispatcher {
                     announce,
                 } => self.on_dialed(conn_id, conn, id, kind, addr, announce),
                 Incoming::Packet(id, packet) => self.on_packet(id, packet),
+                Incoming::Datagram(from, packet) => self.on_datagram(from, packet),
                 Incoming::Closed(id) => self.on_closed(id),
+                Incoming::AddPlugin(id, plugin) => {
+                    self.plugins.insert(id, plugin);
+                }
                 Incoming::Stop => break,
             }
             if self.quit {
@@ -538,8 +701,9 @@ impl Dispatcher {
             REMOTE_PLUGIN_ID => self
                 .remote
                 .on_packet(source, &packet.targets, &packet.payload),
+            MESSENGER_PLUGIN_ID => self.messenger.on_packet(source, &packet.payload),
             other => {
-                log::warn!("ignoring packet for unknown plugin {other}");
+                self.on_custom_plugin(other, source, &packet);
                 return;
             }
         };
@@ -547,6 +711,89 @@ impl Dispatcher {
             Ok(outbound) => self.send_all(outbound),
             Err(e) => log::warn!("ignoring packet from {id:#x}: {e}"),
         }
+    }
+
+    fn on_custom_plugin(&mut self, id: PluginId, source: Source, packet: &Packet) {
+        let Some(plugin) = self.plugins.get_mut(&id) else {
+            log::warn!("ignoring packet for unknown plugin {id}");
+            return;
+        };
+        let messages = plugin.on_packet(
+            plugin::public_source(source),
+            &packet.targets,
+            &packet.payload,
+        );
+        for message in messages {
+            let mut out = plugin::outbound(id, message, Some(source.relation), Some(source.id));
+            out.from = Some(source.origin);
+            self.send(out);
+        }
+    }
+
+    /// A packet that came through UDP. Only events can use it, as they are the
+    /// only ones that can afford to be lost, and they go on through UDP as well.
+    fn on_datagram(&mut self, from: SocketAddr, packet: Packet) {
+        if packet.plugin == ROOT_PLUGIN_ID {
+            if let Ok(RootMsg::UdpRegister(token)) = RootMsg::decode(&packet.payload) {
+                self.on_udp_token(from, token);
+            }
+            return;
+        }
+        let node = self
+            .udp_addrs
+            .get(&from)
+            .and_then(|conn_id| self.nodes_by_conn.get(conn_id))
+            .copied();
+        let Some((id, relation)) = node else {
+            log::debug!("ignoring datagram from unknown address {from}");
+            return;
+        };
+        if packet.plugin != EVENT_PLUGIN_ID {
+            log::warn!("ignoring datagram for plugin {}", packet.plugin);
+            return;
+        }
+        let source = Source {
+            id,
+            relation,
+            origin: id,
+        };
+        match self
+            .event
+            .on_packet(source, &packet.targets, &packet.payload)
+        {
+            Ok(outbound) => {
+                for mut out in outbound {
+                    out.unreliable = true;
+                    self.send(out);
+                }
+            }
+            Err(e) => log::warn!("ignoring datagram from {id:#x}: {e}"),
+        }
+    }
+
+    /// A client proved it owns this address by sending the token over UDP, which
+    /// it had already sent over its connection.
+    fn on_udp_token(&mut self, from: SocketAddr, token: u64) {
+        let Some(conn_id) = self.udp_tokens.remove(&token) else {
+            return;
+        };
+        let Some(&(id, _)) = self.nodes_by_conn.get(&conn_id) else {
+            return;
+        };
+        if let Some(client) = self.directory.lock().unwrap().clients.get_mut(&id) {
+            client.udp = Some(from);
+        }
+        self.udp_addrs.insert(from, conn_id);
+        self.send(Outbound::to_node(
+            ROOT_PLUGIN_ID,
+            RootMsg::UdpReady(true).encode(),
+            id,
+        ));
+    }
+
+    fn forget_udp(&mut self, conn_id: ConnId) {
+        self.udp_tokens.retain(|_, c| *c != conn_id);
+        self.udp_addrs.retain(|_, c| *c != conn_id);
     }
 
     /// The first packet of a connection says what is at the other end.
@@ -578,6 +825,18 @@ impl Dispatcher {
                     conn.close();
                 }
                 self.nodes_by_conn.remove(&conn_id);
+                self.forget_udp(conn_id);
+            }
+            Ok(RootMsg::UdpRegister(token)) if source.relation == Relation::Client => {
+                if self.udp.is_some() {
+                    self.udp_tokens.insert(token, conn_id);
+                } else {
+                    self.send(Outbound::to_node(
+                        ROOT_PLUGIN_ID,
+                        RootMsg::UdpReady(false).encode(),
+                        source.id,
+                    ));
+                }
             }
             Ok(RootMsg::QuitAll) => {
                 // Whoever sent it to this server has also sent it to the rest of
@@ -609,7 +868,12 @@ impl Dispatcher {
                 conn.close();
                 return;
             }
-            directory.clients.insert(new_id, Client { conn, nickname });
+            let client = Client {
+                conn,
+                nickname,
+                udp: None,
+            };
+            directory.clients.insert(new_id, client);
             if directory.master == NO_MASTER {
                 directory.master = new_id;
             }
@@ -744,6 +1008,7 @@ impl Dispatcher {
         out.extend(self.barrier.sync_link(kind, id));
         out.extend(self.alias.sync_link(kind, id));
         out.extend(self.remote.sync_link(kind, id));
+        out.extend(self.messenger.sync_link(kind, id));
         self.send_all(out);
     }
 
@@ -754,6 +1019,7 @@ impl Dispatcher {
         if let Some((id, relation)) = self.nodes_by_conn.remove(&conn_id) {
             self.remove_node(id, relation);
         }
+        self.forget_udp(conn_id);
     }
 
     fn remove_node(&mut self, id: NodeId, relation: Relation) {
@@ -777,6 +1043,12 @@ impl Dispatcher {
         out.extend(self.barrier.unregister_node(id));
         out.extend(self.alias.unregister_node(id));
         out.extend(self.remote.unregister_node(id));
+        out.extend(self.messenger.unregister_node(id));
+        for (&plugin_id, plugin) in &mut self.plugins {
+            for message in plugin.on_node_left(id) {
+                out.push(plugin::outbound(plugin_id, message, None, None));
+            }
+        }
         self.send_all(out);
         if relation == Relation::Client {
             self.update_clients();
@@ -825,7 +1097,12 @@ impl Dispatcher {
                 return;
             }
         };
-        for (id, conn) in recipients {
+        for (id, conn, udp) in recipients {
+            if let (true, Some(addr), Some(socket)) = (out.unreliable, udp, &self.udp) {
+                if frame.len() <= MAX_DATAGRAM_SIZE && socket.send_to(&frame, addr).is_ok() {
+                    continue;
+                }
+            }
             // A failed write closes the connection, and its reading thread then
             // reports it as closed, which removes the node.
             if let Err(e) = conn.send(&frame) {
@@ -840,7 +1117,7 @@ fn is_server_id(id: NodeId) -> bool {
 }
 
 /// Which connections a packet goes to.
-fn resolve(directory: &Directory, out: &Outbound) -> Vec<(NodeId, Arc<Conn>)> {
+fn resolve(directory: &Directory, out: &Outbound) -> Vec<(NodeId, Arc<Conn>, Option<SocketAddr>)> {
     let allowed =
         |id: &NodeId| !out.black.contains(id) && (out.white.is_empty() || out.white.contains(id));
     let everyone = out.targets.contains(&EVERYBODY_ID) || out.targets.contains(&CLIENTS_ID);
@@ -855,7 +1132,7 @@ fn resolve(directory: &Directory, out: &Outbound) -> Vec<(NodeId, Arc<Conn>)> {
         .iter()
         .filter(|(id, _)| everyone || out.targets.contains(id))
         .filter(|(id, _)| allowed(id))
-        .map(|(&id, client)| (id, client.conn.clone()));
+        .map(|(&id, client)| (id, client.conn.clone(), client.udp));
     let links = directory
         .links
         .iter()
@@ -863,6 +1140,6 @@ fn resolve(directory: &Directory, out: &Outbound) -> Vec<(NodeId, Arc<Conn>)> {
             out.targets.contains(id) || (beyond_this_server && out.links.includes(link.info.kind))
         })
         .filter(|(id, _)| allowed(id))
-        .map(|(&id, link)| (id, link.conn.clone()));
+        .map(|(&id, link)| (id, link.conn.clone(), None));
     clients.chain(links).collect()
 }

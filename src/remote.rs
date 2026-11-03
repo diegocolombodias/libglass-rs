@@ -255,6 +255,7 @@ impl RemoteServer {
             white: owners.ids(),
             links: owners.forward_links(source.relation),
             from: Some(source.origin),
+            unreliable: false,
         }])
     }
 

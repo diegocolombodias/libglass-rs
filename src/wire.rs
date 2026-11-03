@@ -90,6 +90,22 @@ macro_rules! raw_wire {
 
 raw_wire!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
 
+/// Any type that implements serde's traits, in bincode format. It takes the place
+/// of Boost Serialization, but it cannot read what the C++ library writes with it.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Serde<T>(pub T);
+
+#[cfg(feature = "serde")]
+impl<T: serde::Serialize + serde::de::DeserializeOwned> Wire for Serde<T> {
+    fn pack(&self) -> Vec<u8> {
+        bincode::serialize(&self.0).unwrap_or_default()
+    }
+    fn unpack(bytes: &[u8]) -> Option<Self> {
+        bincode::deserialize(bytes).ok().map(Serde)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

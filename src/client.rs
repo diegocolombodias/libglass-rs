@@ -3,19 +3,33 @@ use crate::barrier::BarrierSlot;
 use crate::conn::Conn;
 use crate::error::{Error, Result};
 use crate::event::{self, EventSlot};
+use crate::messenger::{self, MessengerSlot};
 use crate::packet::Packet;
-use crate::protocol::{AliasMsg, BarrierKind, BarrierMsg, EventMsg, RemoteMsg, RootMsg, SharedMsg};
+use crate::protocol::{
+    AliasMsg, BarrierKind, BarrierMsg, EventMsg, MessengerMsg, RemoteMsg, RootMsg, SharedMsg,
+};
 use crate::remote::RemoteSlot;
+use crate::server::MAX_DATAGRAM_SIZE;
 use crate::shared::SharedSlot;
+use crate::transport::Stream;
 use crate::types::*;
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::hash::{BuildHasher, Hasher};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const UDP_SETUP_TIMEOUT: Duration = Duration::from_secs(2);
+const UDP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+type PluginHandler = Arc<Mutex<dyn FnMut(NodeId, &[u8]) + Send>>;
 
 /// The state of a client. A single lock and condition variable keep every wait
 /// simple: waiters check their own condition each time anything changes.
@@ -30,12 +44,16 @@ pub(crate) struct ClientState {
     pub(crate) barriers: BTreeMap<(u32, u32), BarrierSlot>,
     pub(crate) aliases: BTreeMap<String, AliasSlot>,
     pub(crate) remotes: BTreeMap<String, RemoteSlot>,
+    pub(crate) messengers: BTreeMap<String, MessengerSlot>,
+    plugin_handlers: BTreeMap<PluginId, PluginHandler>,
+    udp_answer: Option<bool>,
 }
 
 /// The part of a client shared with its reading thread and plugin objects.
 pub(crate) struct ClientCore {
     id: AtomicU32,
     conn: Arc<Conn>,
+    udp: Mutex<Option<Arc<UdpSocket>>>,
     pub(crate) state: Mutex<ClientState>,
     pub(crate) changed: Condvar,
 }
@@ -55,6 +73,30 @@ impl ClientCore {
             payload,
         };
         self.conn.send(&packet.encode()?)
+    }
+
+    /// Sends through UDP if possible. Otherwise, or if it does not fit in a
+    /// datagram, it goes through the connection, which is just more reliable.
+    pub(crate) fn send_unreliable(
+        &self,
+        plugin: PluginId,
+        payload: Vec<u8>,
+        targets: BTreeSet<NodeId>,
+    ) -> Result<()> {
+        let packet = Packet {
+            from: self.id(),
+            plugin,
+            targets,
+            payload,
+        };
+        let frame = packet.encode()?;
+        let socket = self.udp.lock().unwrap().clone();
+        if let Some(socket) = socket {
+            if frame.len() <= MAX_DATAGRAM_SIZE && socket.send(&frame).is_ok() {
+                return Ok(());
+            }
+        }
+        self.conn.send(&frame)
     }
 
     pub(crate) fn send_to_server(&self, plugin: PluginId, payload: Vec<u8>) -> Result<()> {
@@ -78,16 +120,60 @@ pub struct GlassClient {
     core: Arc<ClientCore>,
     nickname: String,
     reader: Option<JoinHandle<()>>,
+    udp_reader: Option<JoinHandle<()>>,
 }
 
 impl GlassClient {
     /// Connects to a server. Returns only after the handshake has finished.
     pub fn connect<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
+        GlassClient::from_stream(Stream::Tcp(TcpStream::connect(server)?), nickname)
+    }
+
+    /// Keeps trying to connect until it works or the time runs out, for when the
+    /// server may not be up yet. Returns the error of the last attempt.
+    pub fn connect_retry<A: ToSocketAddrs>(
+        server: A,
+        nickname: &str,
+        timeout: Duration,
+    ) -> Result<GlassClient> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match GlassClient::connect(&server, nickname) {
+                Ok(client) => return Ok(client),
+                Err(e) if Instant::now() >= deadline => return Err(e),
+                Err(e) => log::debug!("could not connect yet: {e}"),
+            }
+            thread::sleep(CONNECT_RETRY_INTERVAL);
+        }
+    }
+
+    /// Connects to a server, and asks to use UDP for
+    /// [`Event::enqueue_unreliable`](crate::Event::enqueue_unreliable). If that
+    /// does not work, for example because of a firewall, the client still works
+    /// and everything goes through TCP: see [`uses_udp`](Self::uses_udp).
+    pub fn connect_with_udp<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
         let stream = TcpStream::connect(server)?;
+        let peer = stream.peer_addr()?;
+        let mut client = GlassClient::from_stream(Stream::Tcp(stream), nickname)?;
+        if let Err(e) = client.enable_udp(peer) {
+            log::warn!("could not set up UDP: {e}");
+        }
+        Ok(client)
+    }
+
+    /// Connects to a server on a Unix socket.
+    #[cfg(unix)]
+    pub fn connect_unix<P: AsRef<Path>>(path: P, nickname: &str) -> Result<GlassClient> {
+        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        GlassClient::from_stream(Stream::Unix(stream), nickname)
+    }
+
+    fn from_stream(stream: Stream, nickname: &str) -> Result<GlassClient> {
         let (conn, mut reader) = Conn::new(stream)?;
         let core = Arc::new(ClientCore {
             id: AtomicU32::new(NOBODY_ID),
             conn,
+            udp: Mutex::new(None),
             state: Mutex::new(ClientState::default()),
             changed: Condvar::new(),
         });
@@ -110,7 +196,88 @@ impl GlassClient {
             core,
             nickname: nickname.to_owned(),
             reader: Some(reader),
+            udp_reader: None,
         })
+    }
+
+    fn enable_udp(&mut self, server: SocketAddr) -> Result<()> {
+        let local = if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(local)?;
+        socket.connect(server)?;
+
+        let token = RandomState::new().build_hasher().finish();
+        let message = RootMsg::UdpRegister(token).encode();
+        self.core.send_to_server(ROOT_PLUGIN_ID, message.clone())?;
+        let datagram = Packet {
+            from: self.id(),
+            plugin: ROOT_PLUGIN_ID,
+            targets: BTreeSet::new(),
+            payload: message,
+        }
+        .encode()?;
+
+        // Datagrams can be lost, so it repeats until the server has seen one.
+        let deadline = Instant::now() + UDP_SETUP_TIMEOUT;
+        let mut state = self.core.state.lock().unwrap();
+        let accepted = loop {
+            if let Some(answer) = state.udp_answer {
+                break answer;
+            }
+            if Instant::now() >= deadline || state.closed {
+                break false;
+            }
+            // A refused datagram is only an error on some systems.
+            let _ = socket.send(&datagram);
+            state = self
+                .core
+                .changed
+                .wait_timeout(state, UDP_RETRY_INTERVAL)
+                .unwrap()
+                .0;
+        };
+        drop(state);
+        if !accepted {
+            return Err(Error::Timeout);
+        }
+
+        socket.set_read_timeout(Some(UDP_RETRY_INTERVAL))?;
+        let socket = Arc::new(socket);
+        *self.core.udp.lock().unwrap() = Some(socket.clone());
+        let core = self.core.clone();
+        self.udp_reader = Some(thread::spawn(move || udp_loop(core, socket)));
+        Ok(())
+    }
+
+    /// Is this client using UDP for unreliable packets?
+    pub fn uses_udp(&self) -> bool {
+        self.core.udp.lock().unwrap().is_some()
+    }
+
+    /// Sends a packet to a [`ServerPlugin`](crate::ServerPlugin).
+    pub fn send_to_plugin(
+        &self,
+        plugin: PluginId,
+        payload: Vec<u8>,
+        targets: BTreeSet<NodeId>,
+    ) -> Result<()> {
+        self.core.send(plugin, payload, targets)
+    }
+
+    /// Calls `handler` with the sender and content of each packet sent by a plugin
+    /// to this client. It runs on the client's reading thread, so it must not wait
+    /// for another packet. Packets arriving before there is a handler are lost.
+    pub fn set_plugin_handler<F>(&self, plugin: PluginId, handler: F)
+    where
+        F: FnMut(NodeId, &[u8]) + Send + 'static,
+    {
+        let mut state = self.core.state.lock().unwrap();
+        state
+            .plugin_handlers
+            .insert(plugin, Arc::new(Mutex::new(handler)));
     }
 
     pub(crate) fn core(&self) -> &Arc<ClientCore> {
@@ -182,11 +349,14 @@ impl Drop for GlassClient {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        if let Some(reader) = self.udp_reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
 /// Waits for the server's id and node list.
-fn handshake(core: &ClientCore, reader: &mut TcpStream) -> Result<()> {
+fn handshake(core: &ClientCore, reader: &mut Stream) -> Result<()> {
     let mut has_id = false;
     let mut has_list = false;
     while !(has_id && has_list) {
@@ -221,7 +391,24 @@ impl Drop for CloseOnExit {
     }
 }
 
-fn read_loop(core: Arc<ClientCore>, mut reader: TcpStream) {
+/// Reads datagrams until the client closes. Only events travel through UDP.
+fn udp_loop(core: Arc<ClientCore>, socket: Arc<UdpSocket>) {
+    let mut buffer = vec![0u8; MAX_DATAGRAM_SIZE + 1];
+    while !core.state.lock().unwrap().closed {
+        let Ok(size) = socket.recv(&mut buffer) else {
+            continue;
+        };
+        match Packet::decode(&buffer[..size]) {
+            Ok(packet) if packet.plugin == EVENT_PLUGIN_ID => {
+                on_packet(&core, &packet);
+            }
+            Ok(packet) => log::warn!("ignoring datagram for plugin {}", packet.plugin),
+            Err(e) => log::debug!("ignoring invalid datagram: {e}"),
+        }
+    }
+}
+
+fn read_loop(core: Arc<ClientCore>, mut reader: Stream) {
     let _close = CloseOnExit(core.clone());
     loop {
         match Packet::read_from(&mut reader) {
@@ -289,7 +476,26 @@ fn on_packet(core: &ClientCore, packet: &Packet) -> bool {
             Ok(msg) => on_remote(core, packet.from, msg),
             Err(e) => log::warn!("invalid remote message: {e}"),
         },
-        other => log::warn!("ignoring packet for unknown plugin {other}"),
+        MESSENGER_PLUGIN_ID => match MessengerMsg::decode(&packet.payload) {
+            Ok(MessengerMsg::Message { name, data, .. }) => {
+                messenger::deliver(core, &name, packet.from, data)
+            }
+            Ok(other) => log::warn!("unexpected messenger message: {other:?}"),
+            Err(e) => log::warn!("invalid messenger message: {e}"),
+        },
+        other => {
+            let handler = core
+                .state
+                .lock()
+                .unwrap()
+                .plugin_handlers
+                .get(&other)
+                .cloned();
+            match handler {
+                Some(handler) => (handler.lock().unwrap())(packet.from, &packet.payload),
+                None => log::warn!("ignoring packet for unknown plugin {other}"),
+            }
+        }
     }
     true
 }
@@ -333,6 +539,11 @@ fn on_root(core: &ClientCore, packet: &Packet) -> bool {
             true
         }
         Ok(RootMsg::QuitAll) | Ok(RootMsg::Bye) => false,
+        Ok(RootMsg::UdpReady(accepted)) => {
+            core.state.lock().unwrap().udp_answer = Some(accepted);
+            core.changed.notify_all();
+            true
+        }
         Ok(other) => {
             log::warn!("unexpected root message: {other:?}");
             true

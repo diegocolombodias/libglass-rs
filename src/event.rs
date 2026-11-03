@@ -103,6 +103,16 @@ impl<T: Wire + 'static> Event<T> {
         Ok(())
     }
 
+    /// Sends an event that may be lost or arrive out of order, through UDP, which
+    /// is faster for data that is soon replaced by newer data. Without UDP, it
+    /// goes like any other event: see
+    /// [`GlassClient::connect_with_udp`](crate::GlassClient::connect_with_udp).
+    pub fn enqueue_unreliable(&self, data: &T, target: NodeId) -> Result<()> {
+        let msg = EventMsg::Event(self.name.clone(), data.pack());
+        self.core
+            .send_unreliable(EVENT_PLUGIN_ID, msg.encode(), BTreeSet::from([target]))
+    }
+
     /// Removes the first event in the queue, if any.
     pub fn try_get(&self) -> Result<Option<T>> {
         let mut state = self.core.state.lock().unwrap();
@@ -245,6 +255,7 @@ impl EventServer {
                     white: owners.ids(),
                     links: owners.forward_links(source.relation),
                     from: None,
+                    unreliable: false,
                 }])
             }
         }

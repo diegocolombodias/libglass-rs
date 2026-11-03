@@ -69,6 +69,17 @@ impl Barrier {
         self.core.send_to_server(BARRIER_PLUGIN_ID, msg.encode())
     }
 
+    /// Stops this client from taking part in the barrier: the others no longer
+    /// wait for it, and its own calls to sync return right away.
+    pub fn disable(&self) -> Result<()> {
+        self.send(BarrierKind::Disable, false)
+    }
+
+    /// Makes this client take part in the barrier again.
+    pub fn enable(&self) -> Result<()> {
+        self.send(BarrierKind::Enable, false)
+    }
+
     /// Blocks until all the clients with this barrier have called sync.
     pub fn sync(&self) -> Result<()> {
         let key = (self.group, self.number);
@@ -115,6 +126,7 @@ enum State {
     Active,
     Inactive,
     Locked,
+    Disabled,
 }
 
 #[derive(Clone, Copy)]
@@ -167,7 +179,7 @@ impl BarrierEntry {
     fn relevant(&self, kind: LinkKind) -> impl Iterator<Item = &NodeBarrier> {
         self.nodes
             .values()
-            .filter(move |node| node.relation.counts_toward(kind))
+            .filter(move |node| node.state != State::Disabled && node.relation.counts_toward(kind))
     }
 
     /// Tells other servers what has changed on this side of them.
@@ -243,6 +255,14 @@ impl BarrierServer {
                     return Ok(vec![]);
                 };
                 match source.relation {
+                    Relation::Client if node.state == State::Disabled => {
+                        let get_out = message(BarrierKind::GetOut, group, number, false);
+                        return Ok(vec![Outbound::to_node(
+                            BARRIER_PLUGIN_ID,
+                            get_out,
+                            source.id,
+                        )]);
+                    }
                     Relation::Client => node.state = State::Locked,
                     Relation::Peer | Relation::Remote => node.pending += 1,
                 }
@@ -261,7 +281,35 @@ impl BarrierServer {
                     return Ok(vec![]);
                 }
             }
-            BarrierKind::GetOut | BarrierKind::Disable | BarrierKind::Enable => {
+            BarrierKind::Disable | BarrierKind::Enable => {
+                let node = self
+                    .groups
+                    .get_mut(&group)
+                    .and_then(|barriers| barriers.get_mut(&number))
+                    .and_then(|entry| entry.nodes.get_mut(&source.id));
+                let Some(node) = node else {
+                    log::warn!(
+                        "node {:#x} does not own barrier {number}:{group}",
+                        source.id
+                    );
+                    return Ok(vec![]);
+                };
+                let was_locked = node.state == State::Locked;
+                node.state = if msg.kind == BarrierKind::Disable {
+                    State::Disabled
+                } else {
+                    State::Active
+                };
+                let mut out = Vec::new();
+                if was_locked {
+                    // Its sync is in progress, and no one else will end it now.
+                    let get_out = message(BarrierKind::GetOut, group, number, false);
+                    out.push(Outbound::to_node(BARRIER_PLUGIN_ID, get_out, source.id));
+                }
+                out.extend(self.check_update(group, number));
+                return Ok(out);
+            }
+            BarrierKind::GetOut => {
                 log::warn!(
                     "unexpected barrier message from {:#x}: {:?}",
                     source.id,
@@ -542,6 +590,58 @@ mod tests {
     fn sync_of_unknown_barrier_is_ignored() {
         let mut server = BarrierServer::default();
         assert!(sync(&mut server, A).is_empty());
+    }
+
+    #[test]
+    fn disabled_node_does_not_hold_others_back() {
+        let mut server = BarrierServer::default();
+        create(&mut server, A, true);
+        create(&mut server, B, true);
+        let disable = packet(BarrierKind::Disable, false);
+        server.on_packet(client(B), &disable).unwrap();
+        assert_eq!(sync(&mut server, A), BTreeSet::from([A]));
+        // Its own sync returns right away, without changing anything.
+        assert_eq!(sync(&mut server, B), BTreeSet::from([B]));
+
+        let enable = packet(BarrierKind::Enable, false);
+        server.on_packet(client(B), &enable).unwrap();
+        assert!(sync(&mut server, A).is_empty());
+        assert_eq!(sync(&mut server, B), BTreeSet::from([A, B]));
+    }
+
+    #[test]
+    fn disabling_releases_others_and_a_sync_in_progress() {
+        let mut server = BarrierServer::default();
+        create(&mut server, A, true);
+        create(&mut server, B, true);
+        assert!(sync(&mut server, A).is_empty());
+        let disable = packet(BarrierKind::Disable, false);
+        let out = server.on_packet(client(B), &disable).unwrap();
+        assert_eq!(released(&out), BTreeSet::from([A]));
+
+        // Disabling while it is the one waiting.
+        let mut server = BarrierServer::default();
+        create(&mut server, A, true);
+        create(&mut server, B, true);
+        assert!(sync(&mut server, A).is_empty());
+        let out = server.on_packet(client(A), &disable).unwrap();
+        assert_eq!(released(&out), BTreeSet::from([A]));
+    }
+
+    #[test]
+    fn disabled_side_is_removed_for_other_servers() {
+        let mut server = BarrierServer::default();
+        create_global(&mut server, client(A), true);
+        let disable = packet(BarrierKind::Disable, false);
+        let out = server.on_packet(client(A), &disable).unwrap();
+        assert_eq!(kinds_sent(&out), [BarrierKind::Delete, BarrierKind::Delete]);
+
+        let enable = packet(BarrierKind::Enable, false);
+        let out = server.on_packet(client(A), &enable).unwrap();
+        assert_eq!(
+            kinds_sent(&out),
+            [BarrierKind::CreateGlobal, BarrierKind::CreateGlobal]
+        );
     }
 
     #[test]

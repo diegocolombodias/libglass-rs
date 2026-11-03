@@ -17,6 +17,8 @@ pub(crate) struct Outbound {
     pub(crate) links: Links,
     /// The sender written in the packet, if not this server.
     pub(crate) from: Option<NodeId>,
+    /// May it go through UDP, to the clients that use it?
+    pub(crate) unreliable: bool,
 }
 
 impl Outbound {
@@ -30,6 +32,7 @@ impl Outbound {
             white: BTreeSet::new(),
             links: Links::NONE,
             from: None,
+            unreliable: false,
         }
     }
 
@@ -43,6 +46,7 @@ impl Outbound {
             white: BTreeSet::new(),
             links,
             from: None,
+            unreliable: false,
         }
     }
 }

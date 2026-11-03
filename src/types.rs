@@ -27,6 +27,7 @@ pub const BARRIER_PLUGIN_ID: PluginId = 12;
 pub const SHARED_PLUGIN_ID: PluginId = 13;
 pub const EVENT_PLUGIN_ID: PluginId = 14;
 pub const REMOTE_PLUGIN_ID: PluginId = 15;
+pub const MESSENGER_PLUGIN_ID: PluginId = 16;
 
 /// Default TCP port.
 pub const DEFAULT_PORT: u16 = 9191;
