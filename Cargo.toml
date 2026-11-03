@@ -1,0 +1,9 @@
+[package]
+name = "libglass"
+version = "0.1.0"
+edition = "2021"
+description = "Glass - a distributed computing library (Rust port of the C++ libGlass)"
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+log = "0.4"
