@@ -18,6 +18,7 @@ rustup component add clippy
 cargo clippy --all-targets --features serde -- -D warnings
 cargo test --features serde
 cargo run --example quicksort -- 20000 3
+cargo run --example compare_transports -- --quick
 
 cargo build
 python3 bindings/python/test_libglass.py

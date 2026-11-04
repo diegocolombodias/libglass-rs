@@ -97,10 +97,44 @@ que não tem SCTP nativo.
   aqui.
 - **O que não é usado:** os vários streams do SCTP. Tudo vai em um único stream ordenado, porque
   os objetos dependem da ordem dos pacotes.
-- **Desempenho:** não espere mais velocidade que o TCP. Em Linux 6.6, com sockets puros, o TCP
-  passou de 2 GB/s no loopback, e o SCTP ficou em cerca de 1,2 GB/s no loopback e 370 MB/s entre
-  contêineres, com travadas ocasionais de alguns segundos no loopback em transferências grandes.
+- **Desempenho:** é mais lento que o TCP, principalmente em rajadas. Veja a comparação abaixo.
 - **Fora do SCTP:** UDP, `connect_retry`, a API em C e o `render_wall` continuam só com TCP.
+
+### Comparação
+
+O exemplo [compare_transports](examples/compare_transports.rs) mede os três protocolos pela
+própria biblioteca: dois clientes trocam um `Event`, passando pelo servidor. Ele falha se TCP ou
+SCTP perderem, alterarem ou reordenarem alguma mensagem.
+
+```
+cargo run --release --example compare_transports
+```
+
+Para medir entre máquinas, rode `compare_transports -- serve` em uma e
+`compare_transports -- --remote maquina1` em outra.
+
+Resultado com o servidor e os clientes em dois contêineres da mesma máquina, em Linux 6.6, com
+5 repetições, mostrando a mediana:
+
+| Payload | Ida e volta (ms) TCP / UDP / SCTP | Rajada (MB/s) TCP / UDP / SCTP | Perda do UDP na rajada |
+|---|---|---|---|
+| 64 B | 0,126 / 0,116 / 0,134 | 15 / 11 / 0,5 | 18,5% |
+| 1 KiB | 0,132 / 0,130 / 0,148 | 202 / 166 / 60 | 3,3% |
+| 16 KiB | 0,155 / 0,190 / 0,428 | 1741 / 674 / 247 | 4,8% |
+| 60 KB | 0,230 / 0,381 / 0,877 | 1277 / 287 / 300 | 61,4% |
+| 1 MiB | 5,1 / não cabe / 16,8 | 752 / não cabe / 25 | - |
+| 8 MiB | 50 / não cabe / 152 | 424 / não cabe / 176 | - |
+
+- **TCP** foi o mais rápido ou empatou em quase todos os casos, sem perder nada.
+- **UDP** só teve ida e volta melhor que o TCP nos payloads pequenos, e por pouco. Na rajada, ele
+  perde o que o outro lado não consegue absorver, porque não tem controle de fluxo. Na troca de
+  uma mensagem por vez, não houve perda.
+- **SCTP** não perdeu nada, mas teve a menor vazão em quase todos os casos, e variou muito entre
+  repetições: em 16 KiB, de 13 a 262 MB/s. No mesmo processo, ficou pior: 3,3 MB/s em 1 KiB e
+  6,1 MB/s em 60 KB.
+
+Esses números não incluem uma rede de verdade: não há latência nem perda entre os contêineres, e
+nessas condições não aparece nenhuma vantagem do SCTP, como trocar de caminho quando uma rede cai.
 
 ## Estender
 
