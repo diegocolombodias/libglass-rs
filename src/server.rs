@@ -11,14 +11,14 @@ use crate::plugin::{self, ServerPlugin, MAX_RESERVED_PLUGIN_ID};
 use crate::protocol::{PeerAddr, RootMsg, NO_MASTER};
 use crate::remote::RemoteServer;
 use crate::shared::SharedServer;
-use crate::transport::{Listener, Stream};
+use crate::transport::{Listener, Stream, Transport};
 use crate::types::*;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::io::ErrorKind;
 use std::net::Ipv4Addr;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,7 +28,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CLIENTS: NodeId = 0xFFFF;
 const UDP_ERROR_PAUSE: Duration = Duration::from_millis(10);
@@ -125,6 +124,7 @@ struct Options<'a> {
     role: Role,
     seed: Option<&'a str>,
     udp: Option<UdpSocket>,
+    transport: Transport,
 }
 
 impl GlassServer {
@@ -168,6 +168,31 @@ impl GlassServer {
         GlassServer::start_tcp(addr, Role::RemotePeer, seed, false)
     }
 
+    /// Starts a server on SCTP, for clients that use
+    /// [`GlassClient::connect_sctp`](crate::GlassClient::connect_sctp). Returns an
+    /// error if the kernel does not have SCTP.
+    #[cfg(unix)]
+    pub fn bind_sctp<A: ToSocketAddrs>(addr: A) -> Result<GlassServer> {
+        GlassServer::start_sctp(addr, Role::Standalone, None)
+    }
+
+    /// Like [`bind_peer`](Self::bind_peer), with SCTP for the other servers and for
+    /// its clients. All the servers of a group must use it.
+    #[cfg(unix)]
+    pub fn bind_peer_sctp<A: ToSocketAddrs>(addr: A, seed: Option<&str>) -> Result<GlassServer> {
+        GlassServer::start_sctp(addr, Role::Peer, seed)
+    }
+
+    /// Like [`bind_remote_peer`](Self::bind_remote_peer), with SCTP for the other
+    /// servers and for its clients. All the servers involved must use it.
+    #[cfg(unix)]
+    pub fn bind_remote_peer_sctp<A: ToSocketAddrs>(
+        addr: A,
+        seed: Option<&str>,
+    ) -> Result<GlassServer> {
+        GlassServer::start_sctp(addr, Role::RemotePeer, seed)
+    }
+
     /// Starts a server on a Unix socket, for clients on the same machine that
     /// use [`GlassClient::connect_unix`](crate::GlassClient::connect_unix).
     ///
@@ -189,6 +214,7 @@ impl GlassServer {
             role: Role::Standalone,
             seed: None,
             udp: None,
+            transport: Transport::Tcp,
         };
         let mut server = GlassServer::start(Listener::Unix(listener), addr, options)?;
         server.unix_path = Some(path.to_owned());
@@ -208,12 +234,39 @@ impl GlassServer {
         let udp = udp
             .then(|| bind_udp(addr, port_chosen_by_system))
             .transpose()?;
-        let options = Options { role, seed, udp };
+        let options = Options {
+            role,
+            seed,
+            udp,
+            transport: Transport::Tcp,
+        };
         GlassServer::start(Listener::Tcp(listener), addr, options)
     }
 
+    #[cfg(unix)]
+    fn start_sctp<A: ToSocketAddrs>(
+        addr: A,
+        role: Role,
+        seed: Option<&str>,
+    ) -> Result<GlassServer> {
+        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+        let (listener, addr) = Listener::bind_sctp(&addrs)?;
+        let options = Options {
+            role,
+            seed,
+            udp: None,
+            transport: Transport::Sctp,
+        };
+        GlassServer::start(listener, addr, options)
+    }
+
     fn start(listener: Listener, addr: SocketAddr, options: Options) -> Result<GlassServer> {
-        let Options { role, seed, udp } = options;
+        let Options {
+            role,
+            seed,
+            udp,
+            transport,
+        } = options;
         listener.set_nonblocking()?;
 
         let directory = Arc::new(Mutex::new(Directory::default()));
@@ -231,8 +284,8 @@ impl GlassServer {
             _ => LinkKind::Peer,
         };
         if let Some(seed) = seed {
-            match connect_any(seed) {
-                Ok(stream) => join(Stream::Tcp(stream), kind, &mut id, addr, &tx, &next_conn)?,
+            match transport.connect(seed) {
+                Ok(stream) => join(stream, transport, kind, &mut id, addr, &tx, &next_conn)?,
                 Err(e) => log::warn!("could not reach seed {seed}, starting a new group: {e}"),
             }
         }
@@ -434,17 +487,6 @@ fn generate_id() -> NodeId {
     }
 }
 
-fn connect_any<A: ToSocketAddrs>(addr: A) -> std::io::Result<TcpStream> {
-    let mut last_error = None;
-    for addr in addr.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_error = Some(e),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| ErrorKind::NotFound.into()))
-}
-
 /// The address other servers should use to reach this one. If it listens on all
 /// interfaces, the one used by this connection is the one known to work.
 fn advertised_addr(listen: SocketAddr, conn: &Conn) -> PeerAddr {
@@ -463,6 +505,7 @@ fn advertised_addr(listen: SocketAddr, conn: &Conn) -> PeerAddr {
 /// return, `id` is this server's final id.
 fn join(
     stream: Stream,
+    transport: Transport,
     kind: LinkKind,
     id: &mut NodeId,
     listen: SocketAddr,
@@ -519,7 +562,7 @@ fn join(
     for (peer_id, addr) in peers {
         let tx = tx.clone();
         let next_conn = next_conn.clone();
-        thread::spawn(move || dial(peer_id, kind, addr, tx, next_conn));
+        thread::spawn(move || dial(peer_id, transport, kind, addr, tx, next_conn));
     }
     Ok(())
 }
@@ -527,19 +570,20 @@ fn join(
 /// Opens a connection to another server of the group.
 fn dial(
     id: NodeId,
+    transport: Transport,
     kind: LinkKind,
     addr: PeerAddr,
     tx: Sender<Incoming>,
     next_conn: Arc<AtomicU64>,
 ) {
-    let stream = match connect_any((addr.host.as_str(), addr.port)) {
+    let stream = match transport.connect((addr.host.as_str(), addr.port)) {
         Ok(stream) => stream,
         Err(e) => {
             log::warn!("could not connect to peer {id:#x} at {addr:?}: {e}");
             return;
         }
     };
-    let (conn, reader) = match Conn::new(Stream::Tcp(stream)) {
+    let (conn, reader) = match Conn::new(stream) {
         Ok(pair) => pair,
         Err(e) => {
             log::warn!("could not set up connection to peer {id:#x}: {e}");

@@ -75,7 +75,32 @@ começa um grupo novo.
   UDP, que é mais rápido para dados logo substituídos por outros mais novos, mas pode
   perder pacotes. O servidor informa a porta UDP ao cliente. Se UDP não funcionar, ou o
   dado não couber em um datagrama, tudo segue por TCP.
+- **SCTP:** `bind_sctp`, `bind_peer_sctp`, `bind_remote_peer_sctp` e `connect_sctp`, fora do
+  Windows. Veja abaixo.
 - **Unix sockets:** `bind_unix` e `connect_unix`, fora do Windows.
+
+### SCTP
+
+```rust
+let p1 = GlassServer::bind_peer_sctp("0.0.0.0:7001", None)?;
+let p2 = GlassServer::bind_peer_sctp("0.0.0.0:8001", Some("host1:7001"))?;
+let client = GlassClient::connect_sctp("host1:7001", "node0")?;
+```
+
+Um servidor SCTP usa esse protocolo com os outros servidores e com os próprios clientes, e
+todos os servidores de um grupo precisam usá-lo. Não é preciso instalar a `libsctp`, mas o
+kernel precisa ter o módulo `sctp`, ou essas funções retornam erro. Elas não existem no Windows,
+que não tem SCTP nativo.
+
+- **Por que usar com peers:** com o servidor em `0.0.0.0`, o kernel pode usar várias interfaces
+  de rede na mesma associação e trocar de caminho se uma cair. Esse failover não foi testado
+  aqui.
+- **O que não é usado:** os vários streams do SCTP. Tudo vai em um único stream ordenado, porque
+  os objetos dependem da ordem dos pacotes.
+- **Desempenho:** não espere mais velocidade que o TCP. Em Linux 6.6, com sockets puros, o TCP
+  passou de 2 GB/s no loopback, e o SCTP ficou em cerca de 1,2 GB/s no loopback e 370 MB/s entre
+  contêineres, com travadas ocasionais de alguns segundos no loopback em transferências grandes.
+- **Fora do SCTP:** UDP, `connect_retry`, a API em C e o `render_wall` continuam só com TCP.
 
 ## Estender
 
@@ -105,8 +130,8 @@ python bindings/python/test_libglass.py       # depois de cargo build
 cargo run --example quicksort -- 100000 4
 ```
 
-Os testes de Unix sockets não rodam no Windows. Para rodar tudo em Linux, em um contêiner
-descartável:
+Os testes de Unix sockets não rodam no Windows, e os de SCTP são pulados onde ele não existe.
+Para rodar tudo em Linux, em um contêiner descartável:
 
 ```
 docker run --rm -v "${PWD}:/src:ro" rust:1 sh /src/scripts/test-linux.sh
@@ -200,7 +225,6 @@ docker run --rm -v "${PWD}:/src:ro" -v "${PWD}/tests/render_wall/output:/out" ru
 
 | Parte | Motivo |
 |---|---|
-| SCTP | Exige suporte do kernel e chamadas de sistema que a biblioteca padrão não tem, e o protocolo não está disponível nos ambientes de teste usados |
 | UDP puro | No C++ não está no build e não compila. Sem entrega garantida, os outros objetos também não funcionariam nele |
 | Demos com OpenGL | Dependem de GLUT e não foram portados um a um. O `render_wall` faz a divisão em tiles de `tiledrendering`, mas as vistas de CAVE e o estéreo de `cubes` não vieram |
 | Bindings Java e SWIG | Dependem da API em C++. A API em C é a base para refazê-los, e não há JDK nos ambientes de teste usados |

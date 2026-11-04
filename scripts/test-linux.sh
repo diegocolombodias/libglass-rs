@@ -7,6 +7,9 @@
 # The source is mounted read-only, and everything is built inside the container.
 set -e
 
+# Here the SCTP tests must run, instead of being skipped if SCTP is missing.
+export LIBGLASS_REQUIRE_SCTP=1
+
 mkdir /tmp/project
 tar -C /src --exclude=./target -cf - . | tar -C /tmp/project -xf -
 cd /tmp/project

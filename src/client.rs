@@ -12,6 +12,8 @@ use crate::remote::RemoteSlot;
 use crate::server::{wake_udp, MAX_DATAGRAM_SIZE};
 use crate::shared::SharedSlot;
 use crate::transport::Stream;
+#[cfg(unix)]
+use crate::transport::Transport;
 use crate::types::*;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
@@ -161,6 +163,14 @@ impl GlassClient {
             log::warn!("could not set up UDP: {e}");
         }
         Ok(client)
+    }
+
+    /// Connects through SCTP to a server started with
+    /// [`GlassServer::bind_sctp`](crate::GlassServer::bind_sctp) or its variants for
+    /// peers. Returns an error if the kernel does not have SCTP.
+    #[cfg(unix)]
+    pub fn connect_sctp<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
+        GlassClient::from_stream(Transport::Sctp.connect(server)?, nickname)
     }
 
     /// Connects to a server on a Unix socket.

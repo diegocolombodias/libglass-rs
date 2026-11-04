@@ -1,4 +1,6 @@
 use crate::error::Result;
+#[cfg(unix)]
+use crate::transport::sctp_local_addr;
 use crate::transport::Stream;
 use std::io::Write;
 use std::net::IpAddr;
@@ -24,6 +26,8 @@ impl Conn {
         let reader = stream.try_clone()?;
         let local_ip = match &stream {
             Stream::Tcp(s) => s.local_addr()?.ip(),
+            #[cfg(unix)]
+            Stream::Sctp(s) => sctp_local_addr(s)?.ip(),
             #[cfg(unix)]
             Stream::Unix(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
         };

@@ -14,6 +14,12 @@ log = "0.4"
 memmap2 = "0.9"
 serde = { version = "1", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 # Adds `Serde<T>`, to send any type that implements serde's traits.
 serde = ["dep:serde", "dep:bincode"]
