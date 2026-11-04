@@ -13,6 +13,7 @@
 
 mod alias;
 mod barrier;
+pub mod capi;
 mod client;
 mod conn;
 mod error;

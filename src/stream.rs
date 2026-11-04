@@ -25,10 +25,13 @@ fn frame(transfer: u32, kind: u8, data: &[u8]) -> Bytes {
     Bytes(out)
 }
 
+/// The kind and content of each frame of a transfer.
+type Frames = VecDeque<(u8, Vec<u8>)>;
+
 /// Frames of transfers other than the one being received, in order of arrival.
 #[derive(Default)]
 struct Pending {
-    transfers: BTreeMap<(NodeId, u32), VecDeque<(u8, Vec<u8>)>>,
+    transfers: BTreeMap<(NodeId, u32), Frames>,
     arrival: VecDeque<(NodeId, u32)>,
 }
 

@@ -9,14 +9,14 @@ use crate::protocol::{
     AliasMsg, BarrierKind, BarrierMsg, EventMsg, MessengerMsg, RemoteMsg, RootMsg, SharedMsg,
 };
 use crate::remote::RemoteSlot;
-use crate::server::MAX_DATAGRAM_SIZE;
+use crate::server::{wake_udp, MAX_DATAGRAM_SIZE};
 use crate::shared::SharedSlot;
 use crate::transport::Stream;
 use crate::types::*;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -46,14 +46,15 @@ pub(crate) struct ClientState {
     pub(crate) remotes: BTreeMap<String, RemoteSlot>,
     pub(crate) messengers: BTreeMap<String, MessengerSlot>,
     plugin_handlers: BTreeMap<PluginId, PluginHandler>,
-    udp_answer: Option<bool>,
+    udp_port: Option<u16>,
+    udp_ready: bool,
 }
 
 /// The part of a client shared with its reading thread and plugin objects.
 pub(crate) struct ClientCore {
     id: AtomicU32,
     conn: Arc<Conn>,
-    udp: Mutex<Option<Arc<UdpSocket>>>,
+    udp: Mutex<Option<(Arc<UdpSocket>, SocketAddr)>>,
     pub(crate) state: Mutex<ClientState>,
     pub(crate) changed: Condvar,
 }
@@ -90,9 +91,9 @@ impl ClientCore {
             payload,
         };
         let frame = packet.encode()?;
-        let socket = self.udp.lock().unwrap().clone();
-        if let Some(socket) = socket {
-            if frame.len() <= MAX_DATAGRAM_SIZE && socket.send(&frame).is_ok() {
+        let udp = self.udp.lock().unwrap().clone();
+        if let Some((socket, server)) = udp {
+            if frame.len() <= MAX_DATAGRAM_SIZE && socket.send_to(&frame, server).is_ok() {
                 return Ok(());
             }
         }
@@ -153,9 +154,10 @@ impl GlassClient {
     /// and everything goes through TCP: see [`uses_udp`](Self::uses_udp).
     pub fn connect_with_udp<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
         let stream = TcpStream::connect(server)?;
-        let peer = stream.peer_addr()?;
+        let server_ip = stream.peer_addr()?.ip();
+        let local_ip = stream.local_addr()?.ip();
         let mut client = GlassClient::from_stream(Stream::Tcp(stream), nickname)?;
-        if let Err(e) = client.enable_udp(peer) {
+        if let Err(e) = client.enable_udp(local_ip, server_ip) {
             log::warn!("could not set up UDP: {e}");
         }
         Ok(client)
@@ -200,18 +202,33 @@ impl GlassClient {
         })
     }
 
-    fn enable_udp(&mut self, server: SocketAddr) -> Result<()> {
-        let local = if server.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let socket = UdpSocket::bind(local)?;
-        socket.connect(server)?;
+    /// The socket uses the address of the connection, and not all of them, as it
+    /// could otherwise take datagrams meant for a server on the same machine.
+    fn enable_udp(&mut self, local_ip: IpAddr, server_ip: IpAddr) -> Result<()> {
+        let socket = UdpSocket::bind((local_ip, 0))?;
+        let deadline = Instant::now() + UDP_SETUP_TIMEOUT;
 
         let token = RandomState::new().build_hasher().finish();
         let message = RootMsg::UdpRegister(token).encode();
         self.core.send_to_server(ROOT_PLUGIN_ID, message.clone())?;
+
+        // The server says which port to use, or that it has no UDP.
+        let mut state = self.core.state.lock().unwrap();
+        let port = loop {
+            if let Some(port) = state.udp_port {
+                break port;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || state.closed {
+                return Err(Error::Timeout);
+            }
+            state = self.core.changed.wait_timeout(state, remaining).unwrap().0;
+        };
+        if port == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into());
+        }
+        let server = SocketAddr::new(server_ip, port);
+
         let datagram = Packet {
             from: self.id(),
             plugin: ROOT_PLUGIN_ID,
@@ -221,34 +238,25 @@ impl GlassClient {
         .encode()?;
 
         // Datagrams can be lost, so it repeats until the server has seen one.
-        let deadline = Instant::now() + UDP_SETUP_TIMEOUT;
-        let mut state = self.core.state.lock().unwrap();
-        let accepted = loop {
-            if let Some(answer) = state.udp_answer {
-                break answer;
-            }
+        while !state.udp_ready {
             if Instant::now() >= deadline || state.closed {
-                break false;
+                return Err(Error::Timeout);
             }
             // A refused datagram is only an error on some systems.
-            let _ = socket.send(&datagram);
+            let _ = socket.send_to(&datagram, server);
             state = self
                 .core
                 .changed
                 .wait_timeout(state, UDP_RETRY_INTERVAL)
                 .unwrap()
                 .0;
-        };
-        drop(state);
-        if !accepted {
-            return Err(Error::Timeout);
         }
+        drop(state);
 
-        socket.set_read_timeout(Some(UDP_RETRY_INTERVAL))?;
         let socket = Arc::new(socket);
-        *self.core.udp.lock().unwrap() = Some(socket.clone());
+        *self.core.udp.lock().unwrap() = Some((socket.clone(), server));
         let core = self.core.clone();
-        self.udp_reader = Some(thread::spawn(move || udp_loop(core, socket)));
+        self.udp_reader = Some(thread::spawn(move || udp_loop(core, socket, server)));
         Ok(())
     }
 
@@ -350,6 +358,9 @@ impl Drop for GlassClient {
             let _ = reader.join();
         }
         if let Some(reader) = self.udp_reader.take() {
+            if let Some((socket, _)) = &*self.core.udp.lock().unwrap() {
+                wake_udp(socket);
+            }
             let _ = reader.join();
         }
     }
@@ -391,13 +402,24 @@ impl Drop for CloseOnExit {
     }
 }
 
-/// Reads datagrams until the client closes. Only events travel through UDP.
-fn udp_loop(core: Arc<ClientCore>, socket: Arc<UdpSocket>) {
+/// Reads datagrams until the client closes. Only events travel through UDP, and
+/// only what comes from the server counts. It blocks, with no timeout: on Windows, a
+/// datagram that arrives just as a read times out can be lost.
+fn udp_loop(core: Arc<ClientCore>, socket: Arc<UdpSocket>, server: SocketAddr) {
     let mut buffer = vec![0u8; MAX_DATAGRAM_SIZE + 1];
     while !core.state.lock().unwrap().closed {
-        let Ok(size) = socket.recv(&mut buffer) else {
-            continue;
+        let (size, from) = match socket.recv_from(&mut buffer) {
+            Ok(received) => received,
+            Err(e) => {
+                // Windows reports here that a previous send got no one to receive it.
+                log::debug!("UDP read failed: {e}");
+                thread::sleep(UDP_RETRY_INTERVAL);
+                continue;
+            }
         };
+        if from != server {
+            continue;
+        }
         match Packet::decode(&buffer[..size]) {
             Ok(packet) if packet.plugin == EVENT_PLUGIN_ID => {
                 on_packet(&core, &packet);
@@ -539,8 +561,13 @@ fn on_root(core: &ClientCore, packet: &Packet) -> bool {
             true
         }
         Ok(RootMsg::QuitAll) | Ok(RootMsg::Bye) => false,
-        Ok(RootMsg::UdpReady(accepted)) => {
-            core.state.lock().unwrap().udp_answer = Some(accepted);
+        Ok(RootMsg::UdpPort(port)) => {
+            core.state.lock().unwrap().udp_port = Some(port);
+            core.changed.notify_all();
+            true
+        }
+        Ok(RootMsg::UdpReady) => {
+            core.state.lock().unwrap().udp_ready = true;
             core.changed.notify_all();
             true
         }

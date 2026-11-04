@@ -100,10 +100,11 @@ pub enum RootMsg {
     /// Answer to `PeerStart`: your id is taken, use this one.
     PeerChangeId(LinkKind, NodeId),
     /// Client to server, through both the connection and UDP, to link the two.
-    /// This one and `UdpReady` do not exist in the C++ library.
     UdpRegister(u64),
-    /// Server to client: did it work?
-    UdpReady(bool),
+    /// Server to client: the port to send datagrams to, or 0 if it has no UDP.
+    UdpPort(u16),
+    /// Server to client: a datagram with the token has arrived.
+    UdpReady,
 }
 
 impl RootMsg {
@@ -142,7 +143,12 @@ impl RootMsg {
                 out.extend_from_slice(&token.to_be_bytes());
                 out
             }
-            RootMsg::UdpReady(accepted) => vec![7, *accepted as u8],
+            RootMsg::UdpPort(port) => {
+                let mut out = vec![7];
+                out.extend_from_slice(&port.to_be_bytes());
+                out
+            }
+            RootMsg::UdpReady => vec![8],
             RootMsg::PeerStart(kind, addr) => encode_link_addr(*kind, LINK_START, addr),
             RootMsg::PeerListUpdate(kind, addr) => encode_link_addr(*kind, LINK_LIST_UPDATE, addr),
             RootMsg::PeerList(kind, peers) => {
@@ -203,10 +209,15 @@ impl RootMsg {
                     token.try_into().unwrap(),
                 )))
             }
-            7 => match bytes.get(1) {
-                Some(&accepted) => Ok(RootMsg::UdpReady(accepted != 0)),
-                None => Err(Error::InvalidPacket("truncated UDP answer")),
-            },
+            7 => {
+                let port = bytes
+                    .get(1..3)
+                    .ok_or(Error::InvalidPacket("truncated UDP port"))?;
+                Ok(RootMsg::UdpPort(u16::from_be_bytes(
+                    port.try_into().unwrap(),
+                )))
+            }
+            8 => Ok(RootMsg::UdpReady),
             PEER_BASE..=115 => decode_link_message(bytes, kind),
             _ => Err(Error::InvalidPacket("unknown root message")),
         }
@@ -720,8 +731,8 @@ mod tests {
 
         for msg in [
             RootMsg::UdpRegister(0x0102030405060708),
-            RootMsg::UdpReady(true),
-            RootMsg::UdpReady(false),
+            RootMsg::UdpPort(9191),
+            RootMsg::UdpReady,
         ] {
             assert_eq!(RootMsg::decode(&msg.encode()).unwrap(), msg);
         }

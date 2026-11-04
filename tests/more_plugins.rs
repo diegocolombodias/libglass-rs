@@ -516,6 +516,35 @@ fn events_can_travel_through_udp() {
 }
 
 #[test]
+fn servers_with_udp_on_chosen_ports_do_not_collide() {
+    // Many sockets at once, so that TCP gets ports that UDP is already using.
+    let servers: Vec<GlassServer> = (0..20)
+        .map(|_| GlassServer::bind_with_udp("127.0.0.1:0").unwrap())
+        .collect();
+    let clients: Vec<GlassClient> = servers
+        .iter()
+        .map(|server| GlassClient::connect_with_udp(server.local_addr(), "a").unwrap())
+        .collect();
+    assert!(clients.iter().all(GlassClient::uses_udp));
+
+    // A port that was explicitly asked for is not replaced by another one.
+    let taken = servers[0].local_addr();
+    assert!(GlassServer::bind_with_udp(taken).is_err());
+
+    let free_port = {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listener = std::net::TcpListener::bind(socket.local_addr().unwrap());
+        listener.map(|l| l.local_addr().unwrap())
+    };
+    if let Ok(addr) = free_port {
+        // The same number on both, when it is available on both.
+        thread::sleep(SHORT);
+        let server = GlassServer::bind_with_udp(addr).unwrap();
+        assert_eq!(server.udp_addr().unwrap().port(), addr.port());
+    }
+}
+
+#[test]
 fn udp_packet_too_large_goes_through_tcp() {
     let server = GlassServer::bind_with_udp("127.0.0.1:0").unwrap();
     let addr = server.local_addr();
@@ -596,14 +625,15 @@ fn datagrams_from_strangers_are_ignored() {
         targets: BTreeSet::from([EVERYBODY_ID]),
         payload: protocol::EventMsg::Event("ev".into(), b"9".to_vec()).encode(),
     };
-    stranger.send_to(&forged.encode().unwrap(), addr).unwrap();
-    stranger.send_to(&[1, 2, 3], addr).unwrap();
+    let udp = server.udp_addr().unwrap();
+    stranger.send_to(&forged.encode().unwrap(), udp).unwrap();
+    stranger.send_to(&[1, 2, 3], udp).unwrap();
     let token = Packet {
         plugin: ROOT_PLUGIN_ID,
         payload: protocol::RootMsg::UdpRegister(12345).encode(),
         ..Packet::default()
     };
-    stranger.send_to(&token.encode().unwrap(), addr).unwrap();
+    stranger.send_to(&token.encode().unwrap(), udp).unwrap();
 
     wait_until("they arrive", || server.datagrams_received() == 3);
     thread::sleep(SHORT);

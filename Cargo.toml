@@ -3,7 +3,10 @@ name = "libglass"
 version = "0.1.0"
 edition = "2021"
 description = "Glass - a distributed computing library (Rust port of the C++ libGlass)"
-license = "LGPL-2.1-or-later"
+license = "LGPL-2.0-or-later"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 bincode = { version = "1", optional = true }
@@ -16,4 +19,14 @@ serde = { version = "1", optional = true }
 serde = ["dep:serde", "dep:bincode"]
 
 [dev-dependencies]
+glow = "0.18"
+glutin = "0.32"
+glutin-winit = "0.5"
 serde = { version = "1", features = ["derive"] }
+winit = "0.30"
+
+[[example]]
+name = "render_wall"
+path = "examples/render_wall/main.rs"
+# Its synchronization has tests, which do not open any window.
+test = true

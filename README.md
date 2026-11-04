@@ -1,8 +1,8 @@
-# libglass (Rust)
+# libglass
 
-Port em Rust do [libGlass](../libglass), uma biblioteca de computação distribuída
-em C++. Um `GlassServer` coordena vários `GlassClient`s, que se comunicam por
-eventos, variáveis compartilhadas e barreiras.
+Biblioteca de computação distribuída em Rust. Um `GlassServer` coordena vários
+`GlassClient`s, que se comunicam por eventos, variáveis compartilhadas, barreiras e
+outros objetos. Substitui o libGlass em C++, que não é mais desenvolvido.
 
 ```rust
 use libglass::{Barrier, Event, GlassClient, GlassServer, Mode, EVERYBODY_ID};
@@ -18,14 +18,36 @@ let barreira = Barrier::new(&client, 0, 0, true, Mode::Local)?;
 barreira.sync()?;
 ```
 
-```
-cargo test
-```
+## Arquitetura
+
+![Arquitetura: cada nó tem um GlassClient, que troca pacotes com um GlassServer. No servidor, threads de leitura alimentam uma fila única, e uma thread dispatcher entrega os pacotes aos plugins. Servidores se ligam a peers e gateways.](docs/arquitetura.svg)
+
+Cada objeto do cliente conversa com o plugin de mesmo nome no servidor. Toda a lógica do
+servidor roda em uma única thread, que processa um pacote de cada vez, então os plugins não
+precisam de locks.
+
+## Objetos
+
+| Tipo | Para que serve |
+|---|---|
+| `Event<T>` | Fila de mensagens entre clientes, para um nó ou para um grupo |
+| `Messenger<T>` | Mensagens ponto a ponto, em que quem recebe sabe quem enviou |
+| `Shared<T>` | Variável com um valor comum, publicado e buscado explicitamente |
+| `Remote<T>` | Variável própria de cada cliente, que os outros leem e alteram pelo id |
+| `Barrier` | Ponto de sincronização, que pode ser desativado e reativado |
+| `Alias<T>` | Valor local escolhido pelo nome que o grupo deu a este nó |
+| `Stream` | Transferência de arquivos e outros dados grandes |
+| `EventSerializable` | Evento que carrega objetos de classes diferentes na mesma fila |
+| `SharedRegion` | Memória compartilhada entre processos da mesma máquina, sem rede |
+
+Valores trafegam pelo trait `Wire`. Números usam texto, `Raw<T>` usa os bytes nativos e
+`Bytes` envia binário sem alterar. Com a feature `serde`, `Serde<T>` envia qualquer tipo
+que implemente os traits do serde.
 
 ## Vários servidores
 
-Peers formam um grupo: todos se conectam entre si, e os clientes de qualquer um
-deles compartilham os objetos criados com `Mode::Global`. Gateways ligam grupos.
+Peers formam um grupo: todos se conectam entre si, e os clientes de qualquer um deles
+compartilham os objetos criados com `Mode::Global`. Gateways ligam grupos.
 
 ```rust
 // Um grupo com dois peers. Basta conhecer um servidor do grupo.
@@ -38,147 +60,189 @@ let g2 = GlassServer::bind_remote_peer("0.0.0.0:7002", Some("host1:7001"))?;
 let p = GlassServer::bind_peer("0.0.0.0:8002", Some("host2:7002"))?;
 ```
 
-Os pacotes não dão voltas porque cada nível só repassa ao outro: o que vem de um
-cliente vai para peers e gateways, o que vem de um peer vai só para outros grupos,
-e o que vem de outro grupo vai só para os peers locais.
+Os pacotes não dão voltas porque cada nível só repassa ao outro: o que vem de um cliente
+vai para peers e gateways, o que vem de um peer vai só para outros grupos, e o que vem
+de outro grupo vai só para os peers locais.
 
-Cada servidor tem seus próprios clientes e seu próprio master. Se o `seed` não
-responder, o servidor começa um grupo novo, como no C++.
+Cada servidor tem seus próprios clientes e seu próprio master. Um servidor que entra
+depois recebe os objetos globais já existentes. Se o `seed` não responder, o servidor
+começa um grupo novo.
 
-## O que já foi portado
+## Transportes
 
-| Parte do C++ | Situação |
+- **TCP:** o padrão.
+- **TCP + UDP:** com `bind_with_udp` e `connect_with_udp`, `Event::enqueue_unreliable` usa
+  UDP, que é mais rápido para dados logo substituídos por outros mais novos, mas pode
+  perder pacotes. O servidor informa a porta UDP ao cliente. Se UDP não funcionar, ou o
+  dado não couber em um datagrama, tudo segue por TCP.
+- **Unix sockets:** `bind_unix` e `connect_unix`, fora do Windows.
+
+## Estender
+
+Plugins próprios implementam `ServerPlugin` no servidor (`GlassServer::add_plugin`, com
+ids acima de `MAX_RESERVED_PLUGIN_ID`). No cliente, usam `send_to_plugin` e
+`set_plugin_handler`.
+
+## Outras linguagens
+
+[include/libglass.h](include/libglass.h) define a API em C. A biblioteca compilada por
+`cargo build` já a exporta, e [bindings/python](bindings/python) a usa pelo `ctypes`:
+
+```python
+import libglass
+
+with libglass.Server() as server, libglass.Client(server.address, "a") as client:
+    with libglass.Event(client, "ev") as event:
+        event.enqueue(b"oi", send_to_self=True)
+        print(event.get())
+```
+
+## Testes e exemplo
+
+```
+cargo test --features serde
+python bindings/python/test_libglass.py       # depois de cargo build
+cargo run --example quicksort -- 100000 4
+```
+
+Os testes de Unix sockets não rodam no Windows. Para rodar tudo em Linux, em um contêiner
+descartável:
+
+```
+docker run --rm -v "${PWD}:/src:ro" rust:1 sh /src/scripts/test-linux.sh
+```
+
+**No Windows**, `cargo build` compila a biblioteca em qualquer toolchain, mas `cargo test` e
+os exemplos também compilam as dependências de janela do `render_wall`, que precisam de um
+destes:
+
+- Toolchain MSVC, o padrão do Rust, com o componente C++ do Visual Studio.
+- Toolchain GNU com o MinGW completo no `PATH`, porque o `dlltool` que vem com o Rust depende
+  do `as`.
+
+## Renderização distribuída
+
+O exemplo [render_wall](examples/render_wall) é uma parede de tiles com OpenGL 3.3: cada
+janela mostra um pedaço de uma única cena animada, e todas trocam de quadro juntas.
+
+```
+cargo run --example render_wall -- demo 4
+```
+
+Em várias máquinas, com um servidor e quantos nós quiser:
+
+```
+maquina1$ cargo run --example render_wall -- server 0.0.0.0:9191 --wait-for 2
+maquina2$ cargo run --example render_wall -- node maquina1:9191
+maquina3$ cargo run --example render_wall -- node maquina1:9191
+```
+
+| Comando, em qualquer janela | Efeito, em todas |
 |---|---|
-| `Packet`, formato de rede | Portado |
-| `TCP` | Portado |
-| `GlassServer`, `GlassClient` | Portados |
-| `Event`, `Shared`, `Barrier` | Portados, inclusive entre servidores |
-| `GlassServerPeer`, `GlassRemotePeer` | Portados, com lógica global refeita (veja abaixo). `lowpeer` não foi portado |
-| `Alias`, `RemoteVar` (`Remote`) | Portados, com as partes que faltavam no C++ (veja abaixo). `dissociate` não foi portado |
-| `Packager` | Parcial: `Wire` (texto, `Raw`, `Bytes`), sem Boost Serialization |
-| `Messenger`, `Stream` | Falta |
-| `SerializableObject`, `EventSerializable` | Falta |
-| UDP, TCP+UDP, SCTP, Unix sockets | Falta |
-| Memória compartilhada (`Interprocess`, `MemoryManager`) | Falta |
-| Registro de plugins definidos pelo usuário | Falta |
-| Bindings (Java, SWIG), demos, `geditor`, `gtracer` | Falta |
+| Setas, WASD ou arrastar com o mouse | Translação |
+| `+`, `-` ou roda do mouse | Escala |
+| Espaço | Pausa ou retoma a animação |
+| `T` | Mostra ou esconde as bordas dos tiles |
+| `R` | Volta à vista inicial |
+| Esc | Fecha a parede inteira |
 
-## Compatibilidade com o C++
+Para ver a sincronização: a barra amarela e a barra azul atravessam os tiles, e o quadro
+atual aparece em binário na parte de baixo. Se os nós mostrassem quadros diferentes, tudo
+isso quebraria onde dois tiles se encontram.
 
-O formato dos pacotes é o mesmo do C++, conferido por testes com bytes derivados
-da leitura do código original. **Ainda não foi testado contra um binário C++ real.**
+**Como funciona.** Um coordenador sem janela, que roda junto do servidor, decide cada
+quadro. O `Event` leva o estado do quadro a todos, o `Messenger` leva os comandos de
+teclado e mouse ao coordenador, e o `Barrier` segura a troca de buffer até todos terminarem
+de renderizar. Como só o coordenador calcula o estado, os nós não têm como divergir.
+Veja [sync.rs](examples/render_wall/sync.rs).
 
-Entre servidores, as mensagens têm o mesmo formato, mas **um grupo não pode misturar
-peers em C++ e em Rust**. A sequência de conexão mudou, e as atualizações de `Shared`
-passaram a carregar no campo `from` o id do cliente de origem.
+- Um nó pode entrar ou cair a qualquer momento, e a tela é redividida entre os restantes.
+- O nó mais lento dita a velocidade de todos. Para simular isso, use `--delay-ms`.
+- Um nó travado, mas ainda conectado, para a parede inteira, porque `Barrier::sync` não tem
+  timeout.
+- Para testar com carga, use `--cubes`. As demais opções aparecem ao rodar sem argumentos.
 
-`Remote` usa por padrão o formato de texto de `Wire`, enquanto o C++ usa `rawPack`. Para
-conversar com um cliente em C++, use `Raw<T>`.
+**Teste de ponta a ponta.** Abre janelas de verdade e verifica se os tiles juntos formam a
+mesma imagem de uma janela única, se os nós trocam de quadro juntos, e se a parede sobrevive
+a um nó lento, a um nó atrasado e a um nó morto:
 
-## `Alias` e `Remote`: o que mudou em relação ao C++
+```
+cargo build --example render_wall
+python tests/render_wall/test_render_wall.py
+```
 
-`Alias`:
+As imagens e os logs de cada rodada ficam em `tests/render_wall/output`, fora do Git. Com
+`xdotool` instalado, em X11, o teste também aperta teclas e usa o mouse de verdade. Para rodar
+tudo isso em Linux, em um contêiner descartável com tela virtual:
 
-- O campo `associated` não é inicializado no C++, então `checkAlias` pode responder
-  qualquer coisa antes da primeira associação.
-- `associate(map)` envia um pacote vazio no C++. Aqui é `associate_many`.
-- `deleteAlias` é um `TODO` no C++ e aqui funciona.
-- Uma associação para `EVERYBODY_ID` é guardada no C++, mas nunca consultada. Aqui ela
-  vale também para quem criar o alias depois, e substitui as associações individuais
-  feitas antes dela.
-- Associações de um cliente que saiu são esquecidas, porque o id pode ser reaproveitado
-  por um cliente novo.
-- `dissociate` é declarado no C++ sem implementação e sem mensagem no protocolo, então
-  não existe aqui.
-- `Alias<T>` aceita qualquer tipo clonável, inclusive closures dentro de `Arc`.
+```
+docker run --rm -v "${PWD}:/src:ro" -v "${PWD}/tests/render_wall/output:/out" rust:1 sh /src/tests/render_wall/run-linux.sh
+```
 
-`Remote`:
+## Limitações
 
-- `GLASS_GET` e `GLASS_VALUE` são `TODO` no C++, e `getValue` de outro nó devolve
-  referência para uma variável local já destruída. Aqui `get_value` pede o valor e
-  espera a resposta. Se o nó não existir ou não tiver a variável, retorna `Timeout`.
-- `copyDataToRemote` e `copyDataFromRemote` estão desativados no C++ e sempre retornam
-  `false`. Aqui funcionam.
-- `SET` só chega a quem é dono da variável, e uma vez só. O C++ reenvia aos peers
-  depois de já ter enviado.
-- Um cliente em C++ não responde a `GET`, então `get_value` para um deles expira.
-
-## Peers: o que mudou em relação ao C++
-
-A lógica global do C++ tem defeitos de fundo, alguns marcados no próprio código como
-"não está funcionando como esperado". Por isso ela foi refeita em vez de traduzida.
-O que segue vem da leitura do código, sem execução do original.
-
-- **Barreira global:** no C++, `SYNC` nunca chega aos outros servidores, então ela
-  não sincroniza entre eles. Agora sincroniza de verdade.
-- **Objetos criados antes de um peer conectar:** o `TODO` do projeto original registra
-  que nunca chegam a ele, e `synchronize()` é um stub. Agora ele os recebe ao conectar,
-  com os valores atuais de `Shared`.
-- **Relação entre nós:** `PEER_LIST` não transmite a relação, então todo nó da lista
-  vira `RemotePeer`.
-- **Duplicação de conexões:** cada `PEER_LIST_UPDATE` reconecta a todos os peers, e há
-  uma conexão para cada sentido. Agora há uma só por par de servidores.
-- **Laços de pacotes:** o reenvio de eventos entre peers não impede que um pacote
-  volte a quem já o recebeu. Agora a hierarquia impede isso.
-- **`PEER_CHANGE_ID`:** não é decodificado, porque `parse` cai no caso padrão e lança
-  exceção, e a resposta vai para um id ainda não registrado. Agora o conflito de ids é
-  resolvido na entrada.
-- **`Shared` entre peers:** um id de peer podia ficar como "dono" da variável em outro
-  servidor e bloquear atualizações para sempre. Agora a posse é do cliente de origem, e
-  liberá-la propaga para os demais servidores, que chegam ao mesmo valor.
-- **Saída de um nó:** apagar um objeto global, ou um peer cair, agora avisa os outros
-  servidores e libera barreiras presas nele.
-
-Limitações que continuam:
-
-- Um peer que cai não é reconectado.
-- Se a ligação entre dois gateways cair, a posse de uma variável `Shared` por um
-  cliente do outro grupo fica presa até o fim do servidor: clientes de id maior não
-  conseguem mais alterá-la.
+- Um peer que cai não é reconectado, e um cliente também não se reconecta sozinho. O que
+  existe é `connect_retry`, para quando o servidor ainda não subiu.
+- Se a ligação entre dois gateways cair, a posse de uma variável `Shared` por um cliente
+  do outro grupo fica presa até o fim do servidor, e clientes de id maior não conseguem
+  mais alterá-la.
 - Dois servidores que entram por seeds diferentes ao mesmo tempo podem escolher o mesmo
   id. O conflito é detectado na conexão entre eles, mas não corrigido.
+- `Stream` não tem controle de fluxo: quem recebe guarda os dados em memória até chamar
+  `receive`, e quem envia pode ficar muito à frente.
+- Um cliente não sabe quem enviou um `Event`, porque o servidor grava o próprio id. Para
+  saber o remetente, use `Messenger`.
+- Em `Shared`, um cliente de id menor tem prioridade sobre os de id maior até chamar
+  `get_update`. O resultado é o mesmo em todos os servidores, mas o critério merece ser
+  redesenhado.
 
-## Diferenças em relação ao C++
+## O que não veio do C++
 
-**API**
+| Parte | Motivo |
+|---|---|
+| SCTP | Exige suporte do kernel e chamadas de sistema que a biblioteca padrão não tem, e o protocolo não está disponível nos ambientes de teste usados |
+| UDP puro | No C++ não está no build e não compila. Sem entrega garantida, os outros objetos também não funcionariam nele |
+| Demos com OpenGL | Dependem de GLUT e não foram portados um a um. O `render_wall` faz a divisão em tiles de `tiledrendering`, mas as vistas de CAVE e o estéreo de `cubes` não vieram |
+| Bindings Java e SWIG | Dependem da API em C++. A API em C é a base para refazê-los, e não há JDK nos ambientes de teste usados |
+| `geditor`, `gtracer` | Ferramentas em Java que geram código para a API em C++ e leem logs dela |
+| `dissociate`, `lowpeer`, `sendUpdateAll` | No C++ não têm implementação ou uso, e o novo roteamento dispensa `lowpeer` |
+| Formato do Boost Serialization | `Serde<T>` faz esse papel, em outro formato |
 
-- Os objetos recebem o cliente explicitamente (`Event::new(&client, ...)`), em vez
-  do "Glass atual" global (`GlassManager`).
+O formato de rede segue o do C++ em boa parte, mas a compatibilidade com ele não é um
+objetivo e nunca foi testada contra um binário real.
+
+## O que mudou em relação ao C++
+
+**API e arquitetura**
+
+- Os objetos recebem o cliente explicitamente, em vez do "Glass atual" global.
 - Erros são `Result`, em vez de exceções e códigos de retorno.
-- `kill_all` para o servidor e desconecta os clientes, sem encerrar o processo. O
-  C++ chama `exit()` dentro da biblioteca.
-- Eventos ganharam `get_timeout`, que espera sem precisar de `sleep`.
-- `Shared::new` e `Event::new` não têm equivalente aos métodos `factory`: criar
-  de novo o mesmo nome retorna `AlreadyExists`.
-- `nickname_to_id` retorna erro para apelido desconhecido. O C++ retorna
-  `everybodyId`, o que mandaria a mensagem para todos.
+- `kill_all` para os servidores e desconecta os clientes, sem encerrar o processo.
+- Uma thread por conexão lê pacotes e uma única thread os processa no servidor, dona do
+  estado dos plugins. Isso substitui o `select()`, limitado a `FD_SETSIZE` conexões, e os
+  mutexes recursivos.
 
-**Arquitetura**
+**O que não funcionava e agora funciona**
 
-- Uma thread por conexão lê pacotes e uma única thread os processa no servidor,
-  dona do estado dos plugins. Isso substitui `select()`, limitado a `FD_SETSIZE`
-  conexões, e os mutexes recursivos.
-- Usa threads da biblioteca padrão, sem runtime assíncrono.
+Vem da leitura do código, sem execução do original.
 
-**Bugs do C++ que não foram trazidos**
+- Barreira global, que no C++ não sincronizava entre servidores.
+- Objetos criados antes de um peer conectar, que nunca chegavam a ele.
+- Resolução de conflito de ids entre peers.
+- `Remote::get_value` e as cópias entre nós, que eram `TODO` ou estavam desativadas.
+- `Messenger` e `Stream`, que no C++ estão fora do build, e `EventSerializable`, cuja
+  leitura pulava o primeiro caractere do nome.
+- `Barrier::disable` e `enable`, `Alias::delete_alias` e associações para todos.
+- `Shared::get_update`, que agora espera a resposta do servidor.
 
-- `tcp.cpp`: os tamanhos vindos da rede não são validados. `length < headerlen` ou
-  `headerlen < 6` causam underflow e leituras e escritas fora do buffer.
-- `tcp.cpp`: o `recv` inicial de 6 bytes assume que nunca há leitura parcial.
-- `packetclientserver.cpp`: confia no `count` recebido em `NODE_LIST`.
-- O servidor confia no campo `from`, o que permite um cliente se passar por outro.
-  Aqui, o remetente é determinado pela conexão.
-- `event.cpp`: usa o ponteiro `ev` sem inicializar ao apagar evento global, e apaga
-  itens durante a iteração em `unregisterNode`.
-- `barrier.cpp`: `sync()` retorna com o mutex travado num dos caminhos, e
-  `unregisterNode` invalida iteradores.
-- `shared.cpp`: `getUpdate` não espera a resposta do servidor (`TODO` no original).
-- `client.cpp`: `this->~GlassClient()` ao receber `BYE`.
+**Erros de segurança que não vieram**
 
-## Comportamento mantido de propósito
+- Tamanhos vindos da rede não eram validados em `tcp.cpp`, o que permitia leituras e
+  escritas fora do buffer.
+- Qualquer cliente podia se passar por outro pelo campo `from`. Aqui, o remetente é
+  determinado pela conexão, e UDP exige um token enviado antes por TCP.
 
-- O servidor reescreve o remetente dos eventos com o próprio id, então o cliente
-  não sabe quem enviou um evento.
-- Em `Shared`, um cliente de id menor tem prioridade sobre os de id maior até
-  chamar `get_update`. O original marca essa lógica como "não 100% correta", e ela
-  merece ser redesenhada.
+## Licença
+
+LGPL 2 ou posterior, como o libGlass original, de Bruno Barberi Gnecco e Corollarium
+Technologies. Veja [COPYING](COPYING).

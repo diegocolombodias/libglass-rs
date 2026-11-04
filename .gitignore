@@ -1,1 +1,3 @@
 /target
+/tests/render_wall/output
+__pycache__/

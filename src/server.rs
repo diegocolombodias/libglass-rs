@@ -17,9 +17,8 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::io::ErrorKind;
-#[cfg(unix)]
 use std::net::Ipv4Addr;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,7 +31,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CLIENTS: NodeId = 0xFFFF;
-const UDP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const UDP_ERROR_PAUSE: Duration = Duration::from_millis(10);
 /// The largest UDP payload. Whatever is larger goes through the stream.
 pub(crate) const MAX_DATAGRAM_SIZE: usize = 65507;
 
@@ -116,6 +115,7 @@ pub struct GlassServer {
     accept_thread: Option<JoinHandle<()>>,
     dispatch_thread: Option<JoinHandle<()>>,
     udp_thread: Option<JoinHandle<()>>,
+    udp_addr: Option<SocketAddr>,
     datagrams: Arc<AtomicU64>,
     #[cfg(unix)]
     unix_path: Option<PathBuf>,
@@ -124,7 +124,7 @@ pub struct GlassServer {
 struct Options<'a> {
     role: Role,
     seed: Option<&'a str>,
-    udp: bool,
+    udp: Option<UdpSocket>,
 }
 
 impl GlassServer {
@@ -133,8 +133,8 @@ impl GlassServer {
         GlassServer::start_tcp(addr, Role::Standalone, None, false)
     }
 
-    /// Starts a server that also accepts unreliable packets through UDP, on the
-    /// same port number, from clients that use
+    /// Starts a server that also accepts unreliable packets through UDP from
+    /// clients that use
     /// [`GlassClient::connect_with_udp`](crate::GlassClient::connect_with_udp).
     pub fn bind_with_udp<A: ToSocketAddrs>(addr: A) -> Result<GlassServer> {
         GlassServer::start_tcp(addr, Role::Standalone, None, true)
@@ -188,7 +188,7 @@ impl GlassServer {
         let options = Options {
             role: Role::Standalone,
             seed: None,
-            udp: false,
+            udp: None,
         };
         let mut server = GlassServer::start(Listener::Unix(listener), addr, options)?;
         server.unix_path = Some(path.to_owned());
@@ -201,8 +201,13 @@ impl GlassServer {
         seed: Option<&str>,
         udp: bool,
     ) -> Result<GlassServer> {
-        let listener = TcpListener::bind(addr)?;
+        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+        let listener = TcpListener::bind(&addrs[..])?;
         let addr = listener.local_addr()?;
+        let port_chosen_by_system = addrs.iter().all(|addr| addr.port() == 0);
+        let udp = udp
+            .then(|| bind_udp(addr, port_chosen_by_system))
+            .transpose()?;
         let options = Options { role, seed, udp };
         GlassServer::start(Listener::Tcp(listener), addr, options)
     }
@@ -232,9 +237,11 @@ impl GlassServer {
             }
         }
 
-        let udp_socket = udp
-            .then(|| UdpSocket::bind(addr).map(Arc::new))
-            .transpose()?;
+        let udp_socket = udp.map(Arc::new);
+        let udp_addr = match &udp_socket {
+            Some(socket) => Some(socket.local_addr()?),
+            None => None,
+        };
         let datagrams = Arc::new(AtomicU64::new(0));
         let udp_thread = udp_socket.clone().map(|socket| {
             let tx = tx.clone();
@@ -284,6 +291,7 @@ impl GlassServer {
             accept_thread: Some(accept_thread),
             dispatch_thread: Some(dispatch_thread),
             udp_thread,
+            udp_addr,
             datagrams,
             #[cfg(unix)]
             unix_path: None,
@@ -303,6 +311,12 @@ impl GlassServer {
         self.tx
             .send(Incoming::AddPlugin(id, Box::new(plugin)))
             .map_err(|_| Error::Disconnected)
+    }
+
+    /// The address of the UDP socket, if this server has one. It has the same port
+    /// number as the TCP one, unless the system was left to choose them.
+    pub fn udp_addr(&self) -> Option<SocketAddr> {
+        self.udp_addr
     }
 
     /// How many UDP packets this server has received.
@@ -379,6 +393,35 @@ impl Drop for GlassServer {
         if let Some(path) = &self.unix_path {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+/// Opens the UDP socket. If the system chose the TCP port, it chooses this one too:
+/// the same number may not be available for UDP, for example on Windows, which
+/// reserves ranges of ports separately for each protocol.
+fn bind_udp(tcp: SocketAddr, port_chosen_by_system: bool) -> Result<UdpSocket> {
+    let port = if port_chosen_by_system { 0 } else { tcp.port() };
+    Ok(UdpSocket::bind((tcp.ip(), port))?)
+}
+
+/// Sends a datagram to a socket, to wake up a thread blocked reading from it.
+pub(crate) fn wake_udp(socket: &UdpSocket) {
+    let Ok(mut target) = socket.local_addr() else {
+        return;
+    };
+    if target.ip().is_unspecified() {
+        let loopback = match target {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        };
+        target.set_ip(loopback);
+    }
+    let local = match target {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    if let Ok(sender) = UdpSocket::bind((local, 0)) {
+        let _ = sender.send_to(&[0], target);
     }
 }
 
@@ -556,16 +599,22 @@ fn udp_loop(
     stop: Arc<AtomicBool>,
     datagrams: Arc<AtomicU64>,
 ) {
-    if let Err(e) = socket.set_read_timeout(Some(UDP_POLL_INTERVAL)) {
-        log::error!("could not set up UDP: {e}");
-        return;
-    }
+    // It blocks, with no timeout: on Windows, a datagram that arrives just as a read
+    // times out can be lost. To stop, the dispatcher sends this socket a datagram.
     let mut buffer = vec![0u8; MAX_DATAGRAM_SIZE + 1];
     while !stop.load(Ordering::SeqCst) {
         let (size, from) = match socket.recv_from(&mut buffer) {
             Ok(received) => received,
-            Err(_) => continue,
+            Err(e) => {
+                // Windows reports here that a previous send got no one to receive it.
+                log::debug!("UDP read failed: {e}");
+                thread::sleep(UDP_ERROR_PAUSE);
+                continue;
+            }
         };
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
         datagrams.fetch_add(1, Ordering::SeqCst);
         match Packet::decode(&buffer[..size]) {
             Ok(packet) => {
@@ -651,6 +700,9 @@ impl Dispatcher {
         }
 
         stop.store(true, Ordering::SeqCst);
+        if let Some(socket) = &self.udp {
+            wake_udp(socket);
+        }
         for conn in self.conns.values() {
             conn.close();
         }
@@ -786,7 +838,7 @@ impl Dispatcher {
         self.udp_addrs.insert(from, conn_id);
         self.send(Outbound::to_node(
             ROOT_PLUGIN_ID,
-            RootMsg::UdpReady(true).encode(),
+            RootMsg::UdpReady.encode(),
             id,
         ));
     }
@@ -828,15 +880,18 @@ impl Dispatcher {
                 self.forget_udp(conn_id);
             }
             Ok(RootMsg::UdpRegister(token)) if source.relation == Relation::Client => {
-                if self.udp.is_some() {
-                    self.udp_tokens.insert(token, conn_id);
-                } else {
-                    self.send(Outbound::to_node(
-                        ROOT_PLUGIN_ID,
-                        RootMsg::UdpReady(false).encode(),
-                        source.id,
-                    ));
-                }
+                let port = match &self.udp {
+                    Some(socket) => {
+                        self.udp_tokens.insert(token, conn_id);
+                        socket.local_addr().map_or(0, |addr| addr.port())
+                    }
+                    None => 0,
+                };
+                self.send(Outbound::to_node(
+                    ROOT_PLUGIN_ID,
+                    RootMsg::UdpPort(port).encode(),
+                    source.id,
+                ));
             }
             Ok(RootMsg::QuitAll) => {
                 // Whoever sent it to this server has also sent it to the rest of
