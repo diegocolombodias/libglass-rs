@@ -6,7 +6,7 @@
 //! message, and fails if TCP or SCTP lose, change or reorder any.
 //!
 //! ```text
-//! cargo run --release --example compare_transports -- [--repeats N] [--quick]
+//! cargo run --release --example compare_transports -- [--repeats N] [--quick] [--only tcp|udp|sctp]
 //!
 //! machine1$ cargo run --release --example compare_transports -- serve
 //! machine2$ cargo run --release --example compare_transports -- --remote machine1
@@ -439,10 +439,13 @@ fn serve() -> Result<()> {
     Ok(())
 }
 
-fn run(repeats: usize, quick: bool, remote: Option<&str>) -> Result<()> {
+fn run(repeats: usize, quick: bool, remote: Option<&str>, only: Option<&str>) -> Result<()> {
     let divisor = if quick { 10 } else { 1 };
     let mut protocols = Vec::new();
-    for protocol in Protocol::all() {
+    let chosen = Protocol::all()
+        .into_iter()
+        .filter(|p| only.is_none_or(|name| p.name().eq_ignore_ascii_case(name)));
+    for protocol in chosen {
         match Pair::new(protocol, remote) {
             Ok(_) => protocols.push(protocol),
             Err(e) if protocol.may_be_skipped() => {
@@ -469,6 +472,9 @@ fn run(repeats: usize, quick: bool, remote: Option<&str>) -> Result<()> {
         "max",
         "lost"
     );
+    if protocols.is_empty() {
+        return Err("no protocol to measure".into());
+    }
     for load in &LOADS {
         for &protocol in &protocols {
             if !protocol.fits(load.size) {
@@ -494,17 +500,19 @@ fn run(repeats: usize, quick: bool, remote: Option<&str>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    const USAGE: &str = "usage: compare_transports [--repeats N] [--quick] [--remote HOST] | serve";
+    const USAGE: &str = "usage: compare_transports [--repeats N] [--quick] [--remote HOST] [--only PROTOCOL] | serve";
     let mut args = std::env::args().skip(1);
     let mut repeats = None;
     let mut quick = false;
     let mut remote = None;
+    let mut only = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "serve" => return serve(),
             "--quick" => quick = true,
             "--repeats" => repeats = Some(args.next().ok_or(USAGE)?.parse()?),
             "--remote" => remote = Some(args.next().ok_or(USAGE)?),
+            "--only" => only = Some(args.next().ok_or(USAGE)?),
             _ => return Err(USAGE.into()),
         }
     }
@@ -512,5 +520,5 @@ fn main() -> Result<()> {
     if repeats == 0 {
         return Err(USAGE.into());
     }
-    run(repeats, quick, remote.as_deref())
+    run(repeats, quick, remote.as_deref(), only.as_deref())
 }

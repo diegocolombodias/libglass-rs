@@ -42,6 +42,10 @@ void glass_free_bytes(uint8_t *data, size_t len);
 GlassServer *glass_server_new(const char *addr);
 /* seed is any server of the group, or NULL to start a new one. */
 GlassServer *glass_server_new_peer(const char *addr, const char *seed);
+/* The same through SCTP, for clients that use glass_client_connect_sctp. They give
+ * NULL where the system does not have SCTP, as on Windows. */
+GlassServer *glass_server_new_sctp(const char *addr);
+GlassServer *glass_server_new_peer_sctp(const char *addr, const char *seed);
 uint16_t glass_server_port(const GlassServer *server);
 size_t glass_server_total_nodes(const GlassServer *server);
 size_t glass_server_peer_count(const GlassServer *server);
@@ -49,6 +53,7 @@ int glass_server_wait(const GlassServer *server);
 void glass_server_free(GlassServer *server);
 
 GlassClient *glass_client_connect(const char *addr, const char *nickname);
+GlassClient *glass_client_connect_sctp(const char *addr, const char *nickname);
 uint32_t glass_client_id(const GlassClient *client);
 int glass_client_is_master(const GlassClient *client);
 int glass_client_is_connected(const GlassClient *client);

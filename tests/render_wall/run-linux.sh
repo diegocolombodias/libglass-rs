@@ -18,6 +18,9 @@ tar -C /src --exclude=./target --exclude=./tests/render_wall/output -cf - . |
     tar -C /tmp/project -xf -
 cd /tmp/project
 
+# Here the test over SCTP must run, instead of being skipped if SCTP is missing.
+export LIBGLASS_REQUIRE_SCTP=1
+
 cargo test --example render_wall
 cargo build --example render_wall
 LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a -s "-screen 0 1920x1080x24" \

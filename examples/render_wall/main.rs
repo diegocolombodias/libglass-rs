@@ -16,6 +16,8 @@
 //! machine3$ cargo run --example render_wall -- node machine1:9191
 //! ```
 //!
+//! With `--sctp` on the server and on every node, everything goes through SCTP.
+//!
 //! See `usage` below for the keys and the options, and `sync.rs` for how it works.
 
 mod scene;
@@ -31,7 +33,7 @@ use std::process::Command;
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
-use sync::{coordinate, BoxError, Options};
+use sync::{coordinate, BoxError, Options, Protocol};
 use window::{run_node, NodeOptions};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:9191";
@@ -43,6 +45,9 @@ usage:
   render_wall demo [nodes] [--size WxH] [server options]
   render_wall server [address] [server options]
   render_wall node [address] [node options]
+
+options of all:
+  --sctp            uses SCTP instead of TCP, in the server and in every node
 
 server options:
   --wait-for N      does not start until N nodes have joined
@@ -137,9 +142,18 @@ impl Args {
     }
 }
 
+fn protocol(args: &mut Args) -> Protocol {
+    if args.flag("--sctp") {
+        Protocol::Sctp
+    } else {
+        Protocol::Tcp
+    }
+}
+
 fn server_options(args: &mut Args) -> Result<Options, BoxError> {
     let defaults = Options::default();
     let options = Options {
+        protocol: protocol(args),
         fps: args.value("--fps")?.unwrap_or(defaults.fps),
         fixed_step: args.value("--fixed-step")?,
         max_frames: args.value("--frames")?,
@@ -170,7 +184,7 @@ fn run_server(mut args: Args) -> Result<(), BoxError> {
     let options = server_options(&mut args)?;
     args.finish()?;
 
-    let server = GlassServer::bind(address)?;
+    let server = options.protocol.bind(&address)?;
     println!("listening on {}", server.local_addr());
     coordinate(local_address(&server), &options)
 }
@@ -188,7 +202,7 @@ fn run_demo(mut args: Args) -> Result<(), BoxError> {
     options.wait_for = nodes;
     args.finish()?;
 
-    let server = GlassServer::bind("127.0.0.1:0")?;
+    let server = options.protocol.bind("127.0.0.1:0")?;
     let address = local_address(&server);
     println!("listening on {address}");
 
@@ -199,6 +213,7 @@ fn run_demo(mut args: Args) -> Result<(), BoxError> {
             Command::new(&program)
                 .args(["node", &address.to_string(), "--auto-place"])
                 .args(["--size", &format!("{width}x{height}")])
+                .args((options.protocol == Protocol::Sctp).then_some("--sctp"))
                 .spawn()?,
         );
     }
@@ -226,6 +241,7 @@ fn run_node_role(mut args: Args) -> Result<(), BoxError> {
         None => BTreeSet::new(),
     };
     let options = NodeOptions {
+        protocol: protocol(&mut args),
         size: args.pair("--size", 'x')?.unwrap_or(DEFAULT_SIZE),
         position: args.pair("--position", ',')?,
         auto_place: args.flag("--auto-place"),

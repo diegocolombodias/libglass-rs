@@ -19,7 +19,9 @@
 //! with a frame that it has not rendered. So it asks to join, and the coordinator, once
 //! the last frame has been released, holds the next one until the node is in the barrier.
 
-use libglass::{Barrier, Error, Event, GlassClient, Messenger, Mode, NodeId, Wire, EVERYBODY_ID};
+use libglass::{
+    Barrier, Error, Event, GlassClient, GlassServer, Messenger, Mode, NodeId, Wire, EVERYBODY_ID,
+};
 use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::thread;
@@ -276,6 +278,45 @@ impl Wire for Message {
     }
 }
 
+/// How the nodes and the coordinator reach the server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Sctp,
+}
+
+impl Protocol {
+    pub fn bind(self, address: &str) -> Result<GlassServer, BoxError> {
+        match self {
+            Protocol::Tcp => Ok(GlassServer::bind(address)?),
+            #[cfg(unix)]
+            Protocol::Sctp => Ok(GlassServer::bind_sctp(address)?),
+            #[cfg(not(unix))]
+            Protocol::Sctp => Err(NO_SCTP.into()),
+        }
+    }
+
+    /// Keeps trying until `timeout`, as the server may not be up yet.
+    fn connect(
+        self,
+        server: SocketAddr,
+        nickname: &str,
+        timeout: Duration,
+    ) -> Result<GlassClient, BoxError> {
+        match self {
+            Protocol::Tcp => Ok(GlassClient::connect_retry(server, nickname, timeout)?),
+            #[cfg(unix)]
+            Protocol::Sctp => Ok(GlassClient::connect_retry_sctp(server, nickname, timeout)?),
+            #[cfg(not(unix))]
+            Protocol::Sctp => Err(NO_SCTP.into()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+const NO_SCTP: &str = "SCTP is not available on this system";
+
 /// How the coordinator runs the wall.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -288,6 +329,7 @@ pub struct Options {
     pub max_frames: Option<u64>,
     /// Does not start until this many nodes have joined.
     pub wait_for: usize,
+    pub protocol: Protocol,
     /// Moves and zooms the scene on its own, always in the same way.
     pub autopilot: bool,
     pub show_tiles: bool,
@@ -302,6 +344,7 @@ impl Default for Options {
             fixed_step: None,
             max_frames: None,
             wait_for: 0,
+            protocol: Protocol::Tcp,
             autopilot: false,
             show_tiles: true,
             cubes: 12,
@@ -334,7 +377,10 @@ fn wait_joined(inbox: &Messenger<Message>, node: NodeId) -> libglass::Result<boo
 /// Runs the wall until it is told to quit, or until `max_frames`. The server must be
 /// running, and it decides nothing: this could be on any machine.
 pub fn coordinate(server: SocketAddr, options: &Options) -> Result<(), BoxError> {
-    let client = GlassClient::connect(server, COORDINATOR)?;
+    // The server runs in this process, and is already up.
+    let client = options
+        .protocol
+        .connect(server, COORDINATOR, Duration::ZERO)?;
     let frames = Event::<FrameState>::new(&client, FRAMES, Mode::Local)?;
     let inbox = Messenger::<Message>::new(&client, CONTROL, Mode::Local)?;
     let barrier = Barrier::new(&client, 0, 0, true, Mode::Local)?;
@@ -434,9 +480,13 @@ pub struct NodeLink {
 
 impl NodeLink {
     /// Connects and joins the wall. It returns when the node is in the barrier.
-    pub fn join(server: SocketAddr, nickname: &str) -> Result<NodeLink, BoxError> {
+    pub fn join(
+        server: SocketAddr,
+        protocol: Protocol,
+        nickname: &str,
+    ) -> Result<NodeLink, BoxError> {
         let deadline = Instant::now() + JOIN_TIMEOUT;
-        let client = GlassClient::connect_retry(server, nickname, JOIN_TIMEOUT)?;
+        let client = protocol.connect(server, nickname, JOIN_TIMEOUT)?;
         let frames = Event::<FrameState>::new(&client, FRAMES, Mode::Local)?;
         let control = Messenger::<Message>::new(&client, CONTROL, Mode::Local)?;
 
@@ -514,7 +564,6 @@ impl NodeLink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libglass::GlassServer;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
 
@@ -654,7 +703,7 @@ mod tests {
             .map(|i| {
                 let rendered = rendered.clone();
                 thread::spawn(move || {
-                    let link = NodeLink::join(addr, &format!("n{i}")).unwrap();
+                    let link = NodeLink::join(addr, Protocol::Tcp, &format!("n{i}")).unwrap();
                     play(&link, &rendered, &[])
                 })
             })
@@ -680,7 +729,7 @@ mod tests {
         let sender = thread::spawn({
             let rendered = rendered.clone();
             move || {
-                let link = NodeLink::join(addr, "sender").unwrap();
+                let link = NodeLink::join(addr, Protocol::Tcp, "sender").unwrap();
                 link.send(Message::Move(0.5, -0.25)).unwrap();
                 link.send(Message::Zoom(2.0)).unwrap();
                 link.send(Message::TogglePause).unwrap();
@@ -711,7 +760,7 @@ mod tests {
             .map(|i| {
                 let rendered = rendered.clone();
                 thread::spawn(move || {
-                    let link = NodeLink::join(addr, &format!("n{i}")).unwrap();
+                    let link = NodeLink::join(addr, Protocol::Tcp, &format!("n{i}")).unwrap();
                     play(&link, &rendered, &[])
                 })
             })
@@ -744,7 +793,7 @@ mod tests {
                 while rendered.lock().unwrap().keys().last().copied().unwrap_or(0) < enter_at {
                     thread::sleep(Duration::from_millis(1));
                 }
-                let link = NodeLink::join(addr, name).unwrap();
+                let link = NodeLink::join(addr, Protocol::Tcp, name).unwrap();
                 play(&link, &rendered, &[])
             })
         };
@@ -758,7 +807,7 @@ mod tests {
             .map(|i| {
                 let rendered = rendered.clone();
                 thread::spawn(move || {
-                    let link = NodeLink::join(addr, &format!("founder{i}")).unwrap();
+                    let link = NodeLink::join(addr, Protocol::Tcp, &format!("founder{i}")).unwrap();
                     let mut seen = Vec::new();
                     let mut frames_with_all = 0;
                     loop {
@@ -810,13 +859,13 @@ mod tests {
             ..fast()
         });
         let rendered = Rendered::default();
-        let link = NodeLink::join(addr, "leaving").unwrap();
+        let link = NodeLink::join(addr, Protocol::Tcp, "leaving").unwrap();
         let leaving = link.id();
         let survivors: Vec<_> = (0..2)
             .map(|i| {
                 let rendered = rendered.clone();
                 thread::spawn(move || {
-                    let link = NodeLink::join(addr, &format!("n{i}")).unwrap();
+                    let link = NodeLink::join(addr, Protocol::Tcp, &format!("n{i}")).unwrap();
                     let mut seen = Vec::new();
                     loop {
                         let state = link.next_frame(TIMEOUT).unwrap().unwrap();

@@ -16,6 +16,7 @@ by default is tests/render_wall/output.
 import argparse
 import os
 import shutil
+import socket
 import statistics
 import struct
 import subprocess
@@ -271,6 +272,32 @@ def test_demo_starts_and_closes_everything(exe, out):
     subprocess.run([exe, "demo", "2", "--frames", "120", "--size", "320x240"], check=True, timeout=TIMEOUT)
 
 
+def sctp_works():
+    """Whether this system has SCTP. Where it must, as in run-linux.sh, missing it fails."""
+    try:
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM, 132).close()
+        return True
+    except OSError:
+        if os.environ.get("LIBGLASS_REQUIRE_SCTP"):
+            raise
+        return False
+
+
+def test_wall_over_sctp(exe, out):
+    """The same wall, with the server and every node on SCTP."""
+    server = ["--sctp", "--frames", "300", "--autopilot", "--wait-for", "3"]
+    paths = [out / f"sctp{i}.csv" for i in range(3)]
+    node = ["--sctp", "--size", "320x240", "--auto-place", "--log"]
+    run_wall(exe, server, [[*node, str(p)] for p in paths])
+    logs = [read_log(path) for path in paths]
+    check_same_frames(logs)
+    assert len(logs[0]) == 299, len(logs[0])
+    report_skew("over SCTP", logs)
+
+    demo = [exe, "demo", "2", "--sctp", "--frames", "60", "--size", "320x240"]
+    subprocess.run(demo, check=True, timeout=TIMEOUT)
+
+
 def xdotool(*args):
     return subprocess.run(
         ["xdotool", *map(str, args)], check=True, capture_output=True, text=True
@@ -401,6 +428,10 @@ def main():
         tests.append(test_real_input_reaches_all_nodes)
     else:
         print("without xdotool: skipping the test of keys and mouse")
+    if sctp_works():
+        tests.append(test_wall_over_sctp)
+    else:
+        print("without SCTP: skipping the wall over SCTP")
 
     failed = 0
     for test in tests:

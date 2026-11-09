@@ -64,12 +64,15 @@ _declare("last_error", c_char_p)
 _declare("free_bytes", None, _Bytes, c_size_t)
 _declare("server_new", c_void_p, c_char_p)
 _declare("server_new_peer", c_void_p, c_char_p, c_char_p)
+_declare("server_new_sctp", c_void_p, c_char_p)
+_declare("server_new_peer_sctp", c_void_p, c_char_p, c_char_p)
 _declare("server_port", c_uint16, c_void_p)
 _declare("server_total_nodes", c_size_t, c_void_p)
 _declare("server_peer_count", c_size_t, c_void_p)
 _declare("server_wait", c_int, c_void_p)
 _declare("server_free", None, c_void_p)
 _declare("client_connect", c_void_p, c_char_p, c_char_p)
+_declare("client_connect_sctp", c_void_p, c_char_p, c_char_p)
 _declare("client_id", c_uint32, c_void_p)
 _declare("client_is_master", c_int, c_void_p)
 _declare("client_is_connected", c_int, c_void_p)
@@ -160,12 +163,14 @@ class _Object:
 class Server(_Object):
     _free = staticmethod(_lib.glass_server_free)
 
-    def __init__(self, addr="127.0.0.1:0", peer=False, seed=None):
+    def __init__(self, addr="127.0.0.1:0", peer=False, seed=None, sctp=False):
         if peer:
             encoded = seed.encode() if seed else None
-            self._pointer = _created(_lib.glass_server_new_peer(addr.encode(), encoded))
+            new_peer = _lib.glass_server_new_peer_sctp if sctp else _lib.glass_server_new_peer
+            self._pointer = _created(new_peer(addr.encode(), encoded))
         else:
-            self._pointer = _created(_lib.glass_server_new(addr.encode()))
+            new = _lib.glass_server_new_sctp if sctp else _lib.glass_server_new
+            self._pointer = _created(new(addr.encode()))
 
     @property
     def port(self):
@@ -190,8 +195,9 @@ class Server(_Object):
 class Client(_Object):
     _free = staticmethod(_lib.glass_client_free)
 
-    def __init__(self, addr, nickname=""):
-        self._pointer = _created(_lib.glass_client_connect(addr.encode(), nickname.encode()))
+    def __init__(self, addr, nickname="", sctp=False):
+        connect = _lib.glass_client_connect_sctp if sctp else _lib.glass_client_connect
+        self._pointer = _created(connect(addr.encode(), nickname.encode()))
 
     @property
     def id(self):

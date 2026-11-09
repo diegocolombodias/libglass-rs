@@ -233,6 +233,25 @@ fn connecting_to_nothing_is_an_error() {
 }
 
 #[test]
+fn connect_retry_sctp_waits_for_the_server() {
+    if !has_sctp() {
+        return;
+    }
+    // A port that SCTP had free a moment ago.
+    let addr = GlassServer::bind_sctp("127.0.0.1:0").unwrap().local_addr();
+    assert!(GlassClient::connect_retry_sctp(addr, "a", SHORT).is_err());
+
+    let starter = thread::spawn(move || {
+        thread::sleep(SHORT);
+        GlassServer::bind_sctp(addr).unwrap()
+    });
+    let client = GlassClient::connect_retry_sctp(addr, "a", TIMEOUT).unwrap();
+    assert!(client.is_master());
+    drop(client);
+    drop(starter.join().unwrap());
+}
+
+#[test]
 fn tcp_clients_do_not_reach_an_sctp_server() {
     if !has_sctp() {
         return;

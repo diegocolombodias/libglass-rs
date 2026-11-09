@@ -98,6 +98,26 @@ unsafe fn give_bytes(data: Vec<u8>, out: *mut *mut u8, out_len: *mut usize) -> R
     Ok(())
 }
 
+/// # Safety
+/// `pointer` must be a NUL-terminated string, or null.
+unsafe fn optional_text<'a>(pointer: *const c_char) -> Result<Option<&'a str>> {
+    if pointer.is_null() {
+        Ok(None)
+    } else {
+        text(pointer).map(Some)
+    }
+}
+
+/// The SCTP functions exist everywhere, so that the header is the same on every system.
+#[cfg(not(unix))]
+fn no_sctp() -> Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "SCTP is not available on this system",
+    )
+    .into()
+}
+
 fn mode(global: c_int) -> Mode {
     if global != 0 {
         Mode::Global
@@ -148,13 +168,39 @@ pub unsafe extern "C" fn glass_server_new_peer(
     addr: *const c_char,
     seed: *const c_char,
 ) -> *mut GlassServer {
+    guard_new(|| GlassServer::bind_peer(text(addr)?, optional_text(seed)?))
+}
+
+/// # Safety
+/// `addr` must be a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn glass_server_new_sctp(addr: *const c_char) -> *mut GlassServer {
     guard_new(|| {
-        let seed = if seed.is_null() {
-            None
-        } else {
-            Some(text(seed)?)
-        };
-        GlassServer::bind_peer(text(addr)?, seed)
+        #[cfg(unix)]
+        return GlassServer::bind_sctp(text(addr)?);
+        #[cfg(not(unix))]
+        {
+            let _ = addr;
+            Err(no_sctp())
+        }
+    })
+}
+
+/// # Safety
+/// `addr` must be a NUL-terminated string, and `seed` as well, or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_server_new_peer_sctp(
+    addr: *const c_char,
+    seed: *const c_char,
+) -> *mut GlassServer {
+    guard_new(|| {
+        #[cfg(unix)]
+        return GlassServer::bind_peer_sctp(text(addr)?, optional_text(seed)?);
+        #[cfg(not(unix))]
+        {
+            let _ = (addr, seed);
+            Err(no_sctp())
+        }
     })
 }
 
@@ -206,6 +252,24 @@ pub unsafe extern "C" fn glass_client_connect(
     nickname: *const c_char,
 ) -> *mut GlassClient {
     guard_new(|| GlassClient::connect(text(addr)?, text(nickname)?))
+}
+
+/// # Safety
+/// The arguments must be NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_connect_sctp(
+    addr: *const c_char,
+    nickname: *const c_char,
+) -> *mut GlassClient {
+    guard_new(|| {
+        #[cfg(unix)]
+        return GlassClient::connect_sctp(text(addr)?, text(nickname)?);
+        #[cfg(not(unix))]
+        {
+            let _ = (addr, nickname);
+            Err(no_sctp())
+        }
+    })
 }
 
 /// # Safety

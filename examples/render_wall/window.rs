@@ -4,7 +4,7 @@
 //! slowest node takes. The thread of the window keeps answering the system meanwhile.
 
 use crate::scene::Scene;
-use crate::sync::{BoxError, FrameState, Message, NodeLink, Tile};
+use crate::sync::{BoxError, FrameState, Message, NodeLink, Protocol, Tile};
 use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentContext, Version,
@@ -47,6 +47,7 @@ const WHEEL_ZOOM: f64 = 1.1;
 const PIXELS_PER_WHEEL_LINE: f64 = 40.0;
 
 pub struct NodeOptions {
+    pub protocol: Protocol,
     pub size: (u32, u32),
     pub position: Option<(i32, i32)>,
     /// Moves the window to the place of its tile, for when they are on the same screen.
@@ -214,7 +215,7 @@ impl Renderer {
         };
 
         let nickname = format!("node-{}", std::process::id());
-        let link = NodeLink::join(server, &nickname)?;
+        let link = NodeLink::join(server, options.protocol, &nickname)?;
 
         let mut controls = Controls::default();
         let mut size = window.inner_size();

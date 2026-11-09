@@ -139,15 +139,17 @@ impl GlassClient {
         nickname: &str,
         timeout: Duration,
     ) -> Result<GlassClient> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match GlassClient::connect(&server, nickname) {
-                Ok(client) => return Ok(client),
-                Err(e) if Instant::now() >= deadline => return Err(e),
-                Err(e) => log::debug!("could not connect yet: {e}"),
-            }
-            thread::sleep(CONNECT_RETRY_INTERVAL);
-        }
+        retry(timeout, || GlassClient::connect(&server, nickname))
+    }
+
+    /// Like [`connect_retry`](Self::connect_retry), through SCTP.
+    #[cfg(unix)]
+    pub fn connect_retry_sctp<A: ToSocketAddrs>(
+        server: A,
+        nickname: &str,
+        timeout: Duration,
+    ) -> Result<GlassClient> {
+        retry(timeout, || GlassClient::connect_sctp(&server, nickname))
     }
 
     /// Connects to a server, and asks to use UDP for
@@ -589,5 +591,20 @@ fn on_root(core: &ClientCore, packet: &Packet) -> bool {
             log::warn!("invalid root message: {e}");
             true
         }
+    }
+}
+
+fn retry(
+    timeout: Duration,
+    mut connect: impl FnMut() -> Result<GlassClient>,
+) -> Result<GlassClient> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match connect() {
+            Ok(client) => return Ok(client),
+            Err(e) if Instant::now() >= deadline => return Err(e),
+            Err(e) => log::debug!("could not connect yet: {e}"),
+        }
+        thread::sleep(CONNECT_RETRY_INTERVAL);
     }
 }

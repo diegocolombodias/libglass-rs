@@ -98,7 +98,9 @@ que não tem SCTP nativo.
 - **O que não é usado:** os vários streams do SCTP. Tudo vai em um único stream ordenado, porque
   os objetos dependem da ordem dos pacotes.
 - **Desempenho:** é mais lento que o TCP, principalmente em rajadas. Veja a comparação abaixo.
-- **Fora do SCTP:** UDP, `connect_retry`, a API em C e o `render_wall` continuam só com TCP.
+- **Em outras partes:** `connect_retry_sctp`; `glass_server_new_sctp`,
+  `glass_server_new_peer_sctp` e `glass_client_connect_sctp` na API em C; `sctp=True` em
+  Python; e `--sctp` no `render_wall`. O UDP continua só com TCP.
 
 ### Comparação
 
@@ -132,6 +134,9 @@ Resultado com o servidor e os clientes em dois contêineres da mesma máquina, e
 - **SCTP** não perdeu nada, mas teve a menor vazão em quase todos os casos, e variou muito entre
   repetições: em 16 KiB, de 13 a 262 MB/s. No mesmo processo, ficou pior: 3,3 MB/s em 1 KiB e
   6,1 MB/s em 60 KB.
+
+Aumentar os buffers do socket ou confirmar cada pacote (`SCTP_DELAYED_SACK`) não melhorou a
+vazão do SCTP, e em alguns tamanhos piorou.
 
 Esses números não incluem uma rede de verdade: não há latência nem perda entre os contêineres, e
 nessas condições não aparece nenhuma vantagem do SCTP, como trocar de caminho quando uma rede cai.
@@ -169,6 +174,14 @@ Para rodar tudo em Linux, em um contêiner descartável:
 
 ```
 docker run --rm -v "${PWD}:/src:ro" rust:1 sh /src/scripts/test-linux.sh
+```
+
+Para rodar o mesmo em Ubuntu 24.04, que instala o Rust no contêiner antes, troque a imagem e
+passe o script para [scripts/ubuntu.sh](scripts/ubuntu.sh). Isso também vale para o teste de
+ponta a ponta do `render_wall`, mais abaixo:
+
+```
+docker run --rm -v "${PWD}:/src:ro" ubuntu:24.04 sh /src/scripts/ubuntu.sh scripts/test-linux.sh
 ```
 
 **No Windows**, `cargo build` compila a biblioteca em qualquer toolchain, mas `cargo test` e

@@ -1,5 +1,6 @@
 """Tests of the Python bindings. Run with `python bindings/python/test_libglass.py`."""
 
+import os
 import threading
 import time
 import unittest
@@ -111,6 +112,38 @@ class WithPeers(unittest.TestCase):
                         time.sleep(SETTLE)
                         ev_a.enqueue(b"across")
                         self.assertEqual(ev_b.get(), b"across")
+
+
+def sctp_works():
+    try:
+        libglass.Server(sctp=True).close()
+        return True
+    except libglass.GlassError:
+        if os.environ.get("LIBGLASS_REQUIRE_SCTP"):
+            raise
+        return False
+
+
+@unittest.skipUnless(sctp_works(), "SCTP does not work here")
+class WithSctp(unittest.TestCase):
+    def test_event(self):
+        with libglass.Server(sctp=True) as server:
+            with libglass.Client(server.address, "a", sctp=True) as a:
+                with libglass.Client(server.address, "b", sctp=True) as b:
+                    with libglass.Event(a, "ev") as ev_a, libglass.Event(b, "ev") as ev_b:
+                        time.sleep(SETTLE)
+                        ev_a.enqueue(b"sctp")
+                        self.assertEqual(ev_b.get(), b"sctp")
+
+    def test_peers(self):
+        with libglass.Server(peer=True, sctp=True) as p1:
+            with libglass.Server(peer=True, seed=p1.address, sctp=True) as p2:
+                wait_until(lambda: p1.peer_count == 1)
+
+    def test_tcp_client_does_not_reach_it(self):
+        with libglass.Server(sctp=True) as server:
+            with self.assertRaises(libglass.GlassError):
+                libglass.Client(server.address, "a")
 
 
 if __name__ == "__main__":
