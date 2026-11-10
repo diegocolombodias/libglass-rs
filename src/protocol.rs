@@ -388,7 +388,8 @@ impl EventMsg {
 pub enum SharedMsg {
     CreateLocal(String),
     CreateGlobal(String),
-    Update(String, Vec<u8>),
+    /// A new value, and its version. Clients send 0: the server numbers it.
+    Update(String, u64, Vec<u8>),
     Delete(String),
     Sync(String),
     Changed(String, Vec<u8>),
@@ -399,7 +400,11 @@ impl SharedMsg {
         match self {
             SharedMsg::CreateLocal(name) => encode_named(0, name, &[]),
             SharedMsg::CreateGlobal(name) => encode_named(1, name, &[]),
-            SharedMsg::Update(name, data) => encode_named(2, name, data),
+            SharedMsg::Update(name, version, data) => {
+                let mut content = version.to_be_bytes().to_vec();
+                content.extend_from_slice(data);
+                encode_named(2, name, &content)
+            }
             SharedMsg::Delete(name) => encode_named(3, name, &[]),
             SharedMsg::Sync(name) => encode_named(4, name, &[]),
             SharedMsg::Changed(name, data) => encode_named(5, name, data),
@@ -411,7 +416,10 @@ impl SharedMsg {
         match kind {
             0 => Ok(SharedMsg::CreateLocal(name)),
             1 => Ok(SharedMsg::CreateGlobal(name)),
-            2 => Ok(SharedMsg::Update(name, data.to_vec())),
+            2 => {
+                let version = read_u64(data, 0)?;
+                Ok(SharedMsg::Update(name, version, data[8..].to_vec()))
+            }
             3 => Ok(SharedMsg::Delete(name)),
             4 => Ok(SharedMsg::Sync(name)),
             5 => Ok(SharedMsg::Changed(name, data.to_vec())),
@@ -766,6 +774,14 @@ mod tests {
         let msg = SharedMsg::Changed("x".into(), vec![9]);
         assert_eq!(msg.encode(), [5, b'x', 0, 9]);
         assert_eq!(SharedMsg::decode(&msg.encode()).unwrap(), msg);
+
+        let update = SharedMsg::Update("x".into(), 0x0102, vec![9]);
+        assert_eq!(update.encode(), [2, b'x', 0, 0, 0, 0, 0, 0, 0, 1, 2, 9]);
+        assert_eq!(SharedMsg::decode(&update.encode()).unwrap(), update);
+        assert!(
+            SharedMsg::decode(&[2, b'x', 0, 1, 2]).is_err(),
+            "no version"
+        );
     }
 
     #[test]

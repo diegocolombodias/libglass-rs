@@ -335,19 +335,13 @@ fn peers_converge_after_concurrent_updates() {
     });
     thread::sleep(SETTLE);
 
-    // Nobody has synced, so the lowest id holds it on both servers.
-    let expected = if a.id() < b.id() { 1 } else { 2 };
+    // Which one wins depends on the timing, but both servers keep the same.
     var_a.set_update_mode(UpdateMode::Never);
     var_b.set_update_mode(UpdateMode::Never);
-    let (low, high) = if a.id() < b.id() {
-        (&var_a, &var_b)
-    } else {
-        (&var_b, &var_a)
-    };
-    high.get_update().unwrap();
-    low.get_update().unwrap();
-    assert_eq!(var_a.get(), expected);
-    assert_eq!(var_b.get(), expected);
+    var_a.get_update().unwrap();
+    var_b.get_update().unwrap();
+    assert!([1, 2].contains(&var_a.get()));
+    assert_eq!(var_a.get(), var_b.get());
 }
 
 /// Based on `autopeerbarriertest.cpp`, except that here it really synchronizes
@@ -564,45 +558,27 @@ fn gateways_connect_groups() {
     }
 }
 
-/// A client of one group holds a shared variable, and the link to its group breaks.
+/// Across groups too, the last update wins, whatever the ids of the clients.
 #[test]
-fn losing_a_gateway_releases_variables_held_through_it() {
+fn the_last_update_wins_across_groups() {
     let g1 = group(None, "c1");
     let g2 = group(Some(&g1.gateway), "c2");
     wait_until("the gateways connect", || {
         g1.gateway.peers().len() == 2 && g2.gateway.peers().len() == 2
     });
-    // Only a lower id holds the variable against another client.
-    let (holder, other) = if g1.client.id() < g2.client.id() {
-        (g1, g2)
-    } else {
-        (g2, g1)
-    };
-    let held = Shared::new(&holder.client, "x", 0, Mode::Global).unwrap();
-    let wanted = Shared::new(&other.client, "x", 0, Mode::Global).unwrap();
+    let var1 = Shared::new(&g1.client, "x", 0, Mode::Global).unwrap();
+    let var2 = Shared::new(&g2.client, "x", 0, Mode::Global).unwrap();
     thread::sleep(SETTLE);
 
-    // It is held while its client does not call get_update.
-    held.set(1);
-    held.send_update().unwrap();
-    wait_until("the other group sees it", || {
-        wanted.get_update().unwrap();
-        wanted.get() == 1
-    });
-    wanted.set(2);
-    wanted.send_update().unwrap();
-    wanted.get_update().unwrap();
-    assert_eq!(wanted.get(), 1, "the variable should be held");
-
-    let Group { gateway, .. } = holder;
-    drop(gateway);
-    wait_until("the link is gone", || other.gateway.peers().len() == 1);
-    wait_until("the variable is released", || {
-        wanted.set(2);
-        wanted.send_update().unwrap();
-        wanted.get_update().unwrap();
-        wanted.get() == 2
-    });
+    for (writer, reader, value) in [(&var1, &var2, 1), (&var2, &var1, 2), (&var1, &var2, 3)] {
+        // The writer does not call get_update, which used to keep the others out.
+        writer.set(value);
+        writer.send_update().unwrap();
+        wait_until("the other group sees it", || {
+            reader.get_update().unwrap();
+            reader.get() == value
+        });
+    }
 }
 
 #[test]
@@ -988,41 +964,28 @@ fn updates_are_not_lost_when_the_seed_dies() {
 }
 
 #[test]
-fn a_client_leaving_releases_a_shared_variable_on_other_peers() {
+fn a_client_that_does_not_sync_does_not_hold_a_shared_variable() {
     let (_p1, _p2, a, b) = two_peers();
     let var_a = Shared::new(&a, "x", 0i32, Mode::Global).unwrap();
     let var_b = Shared::new(&b, "x", 0i32, Mode::Global).unwrap();
     thread::sleep(SETTLE);
 
-    // Whichever holds it has the lower id; make sure the holder leaves.
-    let (holder, holder_var, other_var, other_client) = if a.id() < b.id() {
-        (a, var_a, var_b, b)
-    } else {
-        (b, var_b, var_a, a)
-    };
-    holder_var.set(1);
-    holder_var.send_update().unwrap();
-    wait_until("the value arrives", || {
-        other_var.get_update().unwrap();
-        other_var.get() == 1
-    });
-
-    // The other client cannot change it while the holder has it.
-    other_var.set(2);
-    other_var.send_update().unwrap();
-    thread::sleep(SETTLE);
-    other_var.get_update().unwrap();
-    assert_eq!(other_var.get(), 1);
-
-    drop(holder_var);
-    drop(holder);
-    thread::sleep(SETTLE);
-
-    other_var.set(2);
-    other_var.send_update().unwrap();
-    other_var.get_update().unwrap();
-    assert_eq!(other_var.get(), 2);
-    assert!(other_client.is_connected());
+    // Both orders, so that the one with the lower id writes first in one of them.
+    for (first, second) in [(&var_a, &var_b), (&var_b, &var_a)] {
+        first.set(1);
+        first.send_update().unwrap();
+        wait_until("the value arrives", || {
+            second.get_update().unwrap();
+            second.get() == 1
+        });
+        second.set(2);
+        second.send_update().unwrap();
+        wait_until("the later value wins on both servers", || {
+            first.get_update().unwrap();
+            second.get_update().unwrap();
+            first.get() == 2 && second.get() == 2
+        });
+    }
 }
 
 #[test]

@@ -32,7 +32,7 @@ precisam de locks.
 |---|---|
 | `Event<T>` | Fila de mensagens entre clientes, para um nó ou para um grupo, com o remetente de cada uma |
 | `Messenger<T>` | Mensagens ponto a ponto, em que quem recebe sabe quem enviou |
-| `Shared<T>` | Variável com um valor comum, publicado e buscado explicitamente |
+| `Shared<T>` | Variável com um valor comum, publicado e buscado explicitamente, em que a última atualização vence |
 | `Remote<T>` | Variável própria de cada cliente, que os outros leem e alteram pelo id |
 | `Barrier` | Ponto de sincronização, que pode ser desativado e reativado |
 | `Alias<T>` | Valor local escolhido pelo nome que o grupo deu a este nó |
@@ -347,9 +347,8 @@ docker run --rm -v "${PWD}:/src:ro" -v "${PWD}/tests/render_wall/output:/out" ru
   servidor ainda o tiver livre, o que inclui um servidor reiniciado no mesmo endereço, desde
   que não seja um peer, cujo id é sorteado. O que foi enviado enquanto ele estava fora e o
   que só o servidor guardava, como associações de `Alias`, se perdem, e o UDP não volta.
-- Em `Shared`, um cliente de id menor tem prioridade sobre os de id maior até chamar
-  `get_update`. O resultado é o mesmo em todos os servidores, mas o critério merece ser
-  redesenhado.
+- Em `Shared`, duas atualizações feitas ao mesmo tempo em servidores diferentes não se
+  misturam: uma delas se perde, e fica a do cliente de id menor.
 
 ## O que não veio do C++
 

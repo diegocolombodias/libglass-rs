@@ -1406,7 +1406,7 @@ impl Dispatcher {
         log::info!("node {id:#x} left");
 
         let mut out = self.event.unregister_node(id);
-        out.extend(self.shared.unregister_node(id, relation));
+        out.extend(self.shared.unregister_node(id));
         out.extend(self.barrier.unregister_node(id));
         out.extend(self.alias.unregister_node(id));
         out.extend(self.remote.unregister_node(id));
