@@ -18,6 +18,13 @@ let barreira = Barrier::new(&client, 0, 0, true, Mode::Local)?;
 barreira.sync()?;
 ```
 
+## Visão geral
+
+![Visão geral: um ambiente virtual 3D colaborativo roda sobre um motor gráfico com OpenGL, que usa a Glass em Rust, em C ou em Python. O arcabouço tem a instanciação (servidor-cliente, mestre-escravo, ponto-a-ponto com peers e gateways, e reconexão automática), os protocolos (TCP, UDP, SCTP, QUIC e Unix socket) e os plugins (eventos, barreiras, compartilhamento, aliases, variáveis remotas, mensagens, fluxos de dados, eventos serializáveis, memória compartilhada e plugins próprios). Em cinza, o que é novo na versão em Rust: a API em C, a reconexão automática e o QUIC.](docs/arquitetura-tese.svg)
+
+A versão em Rust da arquitetura modularizada do libGlass original. Em cinza, o que não existia
+na versão em C++.
+
 ## Arquitetura
 
 ![Arquitetura: cada nó tem um GlassClient, que troca pacotes com um GlassServer. No servidor, threads de leitura alimentam uma fila única, e uma thread dispatcher entrega os pacotes aos plugins. Servidores se ligam a peers e gateways.](docs/arquitetura.svg)
