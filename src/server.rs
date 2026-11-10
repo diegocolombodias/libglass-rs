@@ -9,6 +9,8 @@ use crate::owners::{Links, Relation, Source};
 use crate::packet::Packet;
 use crate::plugin::{self, ServerPlugin, MAX_RESERVED_PLUGIN_ID};
 use crate::protocol::{PeerAddr, RootMsg, NO_MASTER};
+#[cfg(feature = "quic")]
+use crate::quic::{QuicFingerprint, QuicIdentity, QuicTrust};
 use crate::remote::RemoteServer;
 use crate::shared::SharedServer;
 use crate::transport::{Listener, Stream, Transport};
@@ -25,10 +27,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many ids a joining server tries, when another server already has the one it drew.
+const JOIN_ATTEMPTS: usize = 8;
+/// How long a server keeps calling back another one whose link broke.
+const RECONNECT_WINDOW: Duration = Duration::from_secs(30);
+const FIRST_RECONNECT_PAUSE: Duration = Duration::from_millis(100);
+const MAX_RECONNECT_PAUSE: Duration = Duration::from_secs(2);
 const MAX_CLIENTS: NodeId = 0xFFFF;
 const UDP_ERROR_PAUSE: Duration = Duration::from_millis(10);
 /// The largest UDP payload. Whatever is larger goes through the stream.
@@ -38,15 +46,14 @@ type ConnId = u64;
 
 enum Incoming {
     Accepted(ConnId, Arc<Conn>),
-    /// A connection this server opened to another server.
+    /// A connection this server opened to another server, which accepted it.
     Dialed {
         conn_id: ConnId,
         conn: Arc<Conn>,
         id: NodeId,
         kind: LinkKind,
         addr: PeerAddr,
-        /// Does the other server still need to be told who this one is?
-        announce: bool,
+        nonce: u64,
     },
     Packet(ConnId, Packet),
     Datagram(SocketAddr, Packet),
@@ -72,6 +79,9 @@ pub struct PeerInfo {
 struct Link {
     conn: Arc<Conn>,
     info: PeerInfo,
+    /// The number the other server drew when it started. Two servers with the same id
+    /// have different ones, unless one of them is from the C++ library, which has none.
+    nonce: u64,
 }
 
 #[derive(Default)]
@@ -118,6 +128,8 @@ pub struct GlassServer {
     datagrams: Arc<AtomicU64>,
     #[cfg(unix)]
     unix_path: Option<PathBuf>,
+    #[cfg(feature = "quic")]
+    quic_fingerprint: Option<QuicFingerprint>,
 }
 
 struct Options<'a> {
@@ -193,6 +205,48 @@ impl GlassServer {
         GlassServer::start_sctp(addr, Role::RemotePeer, seed)
     }
 
+    /// Starts a server on QUIC, for clients that use
+    /// [`GlassClient::connect_quic`](crate::GlassClient::connect_quic). It generates a
+    /// new self-signed certificate, whose fingerprint
+    /// [`quic_fingerprint`](Self::quic_fingerprint) tells. Clients can only be sure
+    /// they reached this server if they get the fingerprint by a channel they trust:
+    /// see [`QuicTrust`].
+    #[cfg(feature = "quic")]
+    pub fn bind_quic<A: ToSocketAddrs>(addr: A) -> Result<GlassServer> {
+        GlassServer::start_quic(addr, Role::Standalone, None, &QuicIdentity::generate()?)
+    }
+
+    /// Like [`bind_peer`](Self::bind_peer), with QUIC for the other servers and for
+    /// its clients. All the servers of a group must use it, with the same `identity`:
+    /// each one accepts only that certificate from the others.
+    #[cfg(feature = "quic")]
+    pub fn bind_peer_quic<A: ToSocketAddrs>(
+        addr: A,
+        seed: Option<&str>,
+        identity: &QuicIdentity,
+    ) -> Result<GlassServer> {
+        GlassServer::start_quic(addr, Role::Peer, seed, identity)
+    }
+
+    /// Like [`bind_remote_peer`](Self::bind_remote_peer), with QUIC for the other
+    /// servers and for its clients. All the servers involved, in every group, must
+    /// use it with the same `identity`.
+    #[cfg(feature = "quic")]
+    pub fn bind_remote_peer_quic<A: ToSocketAddrs>(
+        addr: A,
+        seed: Option<&str>,
+        identity: &QuicIdentity,
+    ) -> Result<GlassServer> {
+        GlassServer::start_quic(addr, Role::RemotePeer, seed, identity)
+    }
+
+    /// The fingerprint of the certificate of a QUIC server, for
+    /// [`QuicTrust::Fingerprint`].
+    #[cfg(feature = "quic")]
+    pub fn quic_fingerprint(&self) -> Option<QuicFingerprint> {
+        self.quic_fingerprint
+    }
+
     /// Starts a server on a Unix socket, for clients on the same machine that
     /// use [`GlassClient::connect_unix`](crate::GlassClient::connect_unix).
     ///
@@ -260,6 +314,27 @@ impl GlassServer {
         GlassServer::start(listener, addr, options)
     }
 
+    #[cfg(feature = "quic")]
+    fn start_quic<A: ToSocketAddrs>(
+        addr: A,
+        role: Role,
+        seed: Option<&str>,
+        identity: &QuicIdentity,
+    ) -> Result<GlassServer> {
+        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+        let (listener, addr) = Listener::bind_quic(&addrs, identity)?;
+        let fingerprint = identity.fingerprint();
+        let options = Options {
+            role,
+            seed,
+            udp: None,
+            transport: Transport::Quic(QuicTrust::Fingerprint(fingerprint)),
+        };
+        let mut server = GlassServer::start(listener, addr, options)?;
+        server.quic_fingerprint = Some(fingerprint);
+        Ok(server)
+    }
+
     fn start(listener: Listener, addr: SocketAddr, options: Options) -> Result<GlassServer> {
         let Options {
             role,
@@ -283,11 +358,15 @@ impl GlassServer {
             Role::RemotePeer => LinkKind::Remote,
             _ => LinkKind::Peer,
         };
+        let nonce = generate_nonce();
         if let Some(seed) = seed {
-            match transport.connect(seed) {
-                Ok(stream) => join(stream, transport, kind, &mut id, addr, &tx, &next_conn)?,
-                Err(e) => log::warn!("could not reach seed {seed}, starting a new group: {e}"),
-            }
+            let joining = Joining {
+                transport,
+                kind,
+                nonce,
+                listen: addr,
+            };
+            joining.join(seed, &mut id, &tx, &next_conn)?;
         }
 
         let udp_socket = udp.map(Arc::new);
@@ -312,8 +391,14 @@ impl GlassServer {
         let dispatch_thread = {
             let dispatcher = Dispatcher {
                 id,
+                nonce,
                 role,
+                transport,
                 listen: addr,
+                tx: tx.clone(),
+                next_conn: next_conn.clone(),
+                stop: stop.clone(),
+                departed: BTreeSet::new(),
                 directory: directory.clone(),
                 conns: BTreeMap::new(),
                 nodes_by_conn: BTreeMap::new(),
@@ -348,6 +433,8 @@ impl GlassServer {
             datagrams,
             #[cfg(unix)]
             unix_path: None,
+            #[cfg(feature = "quic")]
+            quic_fingerprint: None,
         })
     }
 
@@ -478,6 +565,16 @@ pub(crate) fn wake_udp(socket: &UdpSocket) {
     }
 }
 
+/// A random number, other than 0, which stands for no number.
+fn generate_nonce() -> u64 {
+    loop {
+        let nonce = RandomState::new().build_hasher().finish();
+        if nonce != 0 {
+            return nonce;
+        }
+    }
+}
+
 /// A random id for a server. Clashes are detected when joining a group.
 fn generate_id() -> NodeId {
     let random = RandomState::new().build_hasher().finish() as NodeId;
@@ -501,107 +598,178 @@ fn advertised_addr(listen: SocketAddr, conn: &Conn) -> PeerAddr {
     }
 }
 
-/// Joins a group through a server of it, then connects to the others found. On
-/// return, `id` is this server's final id.
-fn join(
-    stream: Stream,
+/// What a server that joins a group needs to know about itself.
+struct Joining {
     transport: Transport,
     kind: LinkKind,
-    id: &mut NodeId,
+    nonce: u64,
     listen: SocketAddr,
-    tx: &Sender<Incoming>,
-    next_conn: &Arc<AtomicU64>,
-) -> Result<()> {
-    let (conn, mut reader) = Conn::new(stream)?;
-    let start = Packet {
-        from: *id,
-        plugin: ROOT_PLUGIN_ID,
-        targets: BTreeSet::new(),
-        payload: RootMsg::PeerStart(kind, advertised_addr(listen, &conn)).encode(),
-    };
-    conn.send(&start.encode()?)?;
-
-    reader.set_read_timeout(Some(JOIN_TIMEOUT))?;
-    let (seed_id, mut peers) = loop {
-        let packet = Packet::read_from(&mut reader)?.ok_or(Error::Disconnected)?;
-        if packet.plugin != ROOT_PLUGIN_ID {
-            continue;
-        }
-        match RootMsg::decode(&packet.payload)? {
-            RootMsg::PeerChangeId(_, new_id) => {
-                log::info!("id {:#x} is taken, using {new_id:#x}", *id);
-                *id = new_id;
-            }
-            RootMsg::PeerList(_, peers) => break (packet.from, peers),
-            other => log::warn!("unexpected message while joining: {other:?}"),
-        }
-    };
-    reader.set_read_timeout(None)?;
-
-    let seed_addr = peers.remove(&seed_id).unwrap_or(PeerAddr {
-        host: String::new(),
-        port: 0,
-    });
-    peers.remove(id);
-
-    let conn_id = next_conn.fetch_add(1, Ordering::SeqCst);
-    tx.send(Incoming::Dialed {
-        conn_id,
-        conn,
-        id: seed_id,
-        kind,
-        addr: seed_addr,
-        announce: false,
-    })
-    .map_err(|_| Error::Disconnected)?;
-    {
-        let tx = tx.clone();
-        thread::spawn(move || read_loop(reader, conn_id, tx));
-    }
-
-    for (peer_id, addr) in peers {
-        let tx = tx.clone();
-        let next_conn = next_conn.clone();
-        thread::spawn(move || dial(peer_id, transport, kind, addr, tx, next_conn));
-    }
-    Ok(())
 }
 
-/// Opens a connection to another server of the group.
-fn dial(
+/// A connection to a server of the group, which has accepted this one.
+struct Joined {
+    conn: Arc<Conn>,
+    reader: Stream,
     id: NodeId,
-    transport: Transport,
-    kind: LinkKind,
     addr: PeerAddr,
-    tx: Sender<Incoming>,
-    next_conn: Arc<AtomicU64>,
-) {
-    let stream = match transport.connect((addr.host.as_str(), addr.port)) {
-        Ok(stream) => stream,
-        Err(e) => {
-            log::warn!("could not connect to peer {id:#x} at {addr:?}: {e}");
-            return;
+    nonce: u64,
+}
+
+impl Joining {
+    /// Joins a group through a server of it, then connects to the others found, and
+    /// only returns when they have all accepted this server. If one of them already
+    /// knows another server with this id, this one starts over with another id, which
+    /// it can do because it has no clients yet. On return, `id` is the final id.
+    ///
+    /// If the seed cannot be reached, the server starts a group of its own.
+    fn join(
+        &self,
+        seed: &str,
+        id: &mut NodeId,
+        tx: &Sender<Incoming>,
+        next_conn: &Arc<AtomicU64>,
+    ) -> Result<()> {
+        for attempt in 0..JOIN_ATTEMPTS {
+            let stream = match self.transport.connect(seed) {
+                Ok(stream) => stream,
+                Err(e) if attempt == 0 => {
+                    log::warn!("could not reach seed {seed}, starting a new group: {e}");
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            match self.try_join(stream, id)? {
+                Some(links) => {
+                    for link in links {
+                        let conn_id = next_conn.fetch_add(1, Ordering::SeqCst);
+                        let dialed = Incoming::Dialed {
+                            conn_id,
+                            conn: link.conn,
+                            id: link.id,
+                            kind: self.kind,
+                            addr: link.addr,
+                            nonce: link.nonce,
+                        };
+                        tx.send(dialed).map_err(|_| Error::Disconnected)?;
+                        let tx = tx.clone();
+                        thread::spawn(move || read_loop(link.reader, conn_id, tx));
+                    }
+                    return Ok(());
+                }
+                None => {
+                    let taken = *id;
+                    *id = generate_id();
+                    log::info!("another server has id {taken:#x}, trying {:#x}", *id);
+                }
+            }
         }
-    };
-    let (conn, reader) = match Conn::new(stream) {
-        Ok(pair) => pair,
-        Err(e) => {
-            log::warn!("could not set up connection to peer {id:#x}: {e}");
-            return;
-        }
-    };
-    let conn_id = next_conn.fetch_add(1, Ordering::SeqCst);
-    let dialed = Incoming::Dialed {
-        conn_id,
-        conn,
-        id,
-        kind,
-        addr,
-        announce: true,
-    };
-    if tx.send(dialed).is_ok() {
-        read_loop(reader, conn_id, tx);
+        Err(Error::AlreadyExists("server id".into()))
     }
+
+    /// One attempt to join. Gives `None` if the id is taken.
+    fn try_join(&self, stream: Stream, id: &mut NodeId) -> Result<Option<Vec<Joined>>> {
+        let (conn, mut reader) = Conn::new(stream)?;
+        let addr = advertised_addr(self.listen, &conn);
+        send_root(&conn, *id, RootMsg::PeerStart(self.kind, addr, self.nonce))?;
+
+        reader.set_read_timeout(Some(JOIN_TIMEOUT))?;
+        let mut seed_nonce = 0;
+        let (seed_id, mut peers) = loop {
+            let packet = Packet::read_from(&mut reader)?.ok_or(Error::Disconnected)?;
+            if packet.plugin != ROOT_PLUGIN_ID {
+                continue;
+            }
+            match RootMsg::decode(&packet.payload)? {
+                RootMsg::PeerChangeId(_, new_id) => {
+                    log::info!("id {:#x} is taken, using {new_id:#x}", *id);
+                    *id = new_id;
+                }
+                RootMsg::PeerAccepted(_, nonce) => seed_nonce = nonce,
+                RootMsg::PeerList(_, peers) => break (packet.from, peers),
+                other => log::warn!("unexpected message while joining: {other:?}"),
+            }
+        };
+        reader.set_read_timeout(None)?;
+
+        let seed_addr = peers.remove(&seed_id).unwrap_or(PeerAddr {
+            host: String::new(),
+            port: 0,
+        });
+        peers.remove(id);
+        let mut links = vec![Joined {
+            conn,
+            reader,
+            id: seed_id,
+            addr: seed_addr,
+            nonce: seed_nonce,
+        }];
+
+        for (peer_id, addr) in peers {
+            match self.announce(*id, peer_id, &addr) {
+                Ok(Some((conn, reader, nonce))) => links.push(Joined {
+                    conn,
+                    reader,
+                    id: peer_id,
+                    addr,
+                    nonce,
+                }),
+                Ok(None) => {
+                    for link in &links {
+                        link.conn.close();
+                    }
+                    return Ok(None);
+                }
+                Err(e) => log::warn!("could not join peer {peer_id:#x} at {addr:?}: {e}"),
+            }
+        }
+        Ok(Some(links))
+    }
+
+    /// Tells another server of the group about this one, and waits for its answer.
+    /// Gives `None` if it says the id is taken.
+    fn announce(
+        &self,
+        id: NodeId,
+        peer_id: NodeId,
+        addr: &PeerAddr,
+    ) -> Result<Option<(Arc<Conn>, Stream, u64)>> {
+        let stream = self.transport.connect((addr.host.as_str(), addr.port))?;
+        let (conn, mut reader) = Conn::new(stream)?;
+        let own = advertised_addr(self.listen, &conn);
+        send_root(
+            &conn,
+            id,
+            RootMsg::PeerListUpdate(self.kind, own, self.nonce),
+        )?;
+
+        reader.set_read_timeout(Some(JOIN_TIMEOUT))?;
+        let packet = Packet::read_from(&mut reader)?.ok_or(Error::Disconnected)?;
+        reader.set_read_timeout(None)?;
+        let answer = match packet.plugin {
+            ROOT_PLUGIN_ID => RootMsg::decode(&packet.payload)?,
+            _ => return Err(Error::InvalidPacket("no answer to the announce")),
+        };
+        match answer {
+            RootMsg::PeerAccepted(_, nonce) => Ok(Some((conn, reader, nonce))),
+            RootMsg::PeerIdTaken(_) => {
+                log::info!("server {peer_id:#x} already knows a server with id {id:#x}");
+                conn.close();
+                Ok(None)
+            }
+            _ => Err(Error::InvalidPacket("unexpected answer to the announce")),
+        }
+    }
+}
+
+/// Writes to a connection that does not belong to a known node yet.
+fn send_root(conn: &Conn, from: NodeId, message: RootMsg) -> Result<()> {
+    let packet = Packet {
+        from,
+        plugin: ROOT_PLUGIN_ID,
+        targets: BTreeSet::new(),
+        payload: message.encode(),
+    };
+    conn.send(&packet.encode()?)
 }
 
 fn accept_loop(
@@ -691,8 +859,17 @@ fn read_loop(mut reader: Stream, id: ConnId, tx: Sender<Incoming>) {
 
 struct Dispatcher {
     id: NodeId,
+    /// The number this server drew when it started.
+    nonce: u64,
     role: Role,
+    transport: Transport,
     listen: SocketAddr,
+    /// What a thread that calls back another server needs.
+    tx: Sender<Incoming>,
+    next_conn: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    /// Servers that said they were leaving, which are not called back.
+    departed: BTreeSet<NodeId>,
     directory: Arc<Mutex<Directory>>,
     conns: BTreeMap<ConnId, Arc<Conn>>,
     nodes_by_conn: BTreeMap<ConnId, (NodeId, Relation)>,
@@ -728,8 +905,8 @@ impl Dispatcher {
                     id,
                     kind,
                     addr,
-                    announce,
-                } => self.on_dialed(conn_id, conn, id, kind, addr, announce),
+                    nonce,
+                } => self.on_dialed(conn_id, conn, id, kind, addr, nonce),
                 Incoming::Packet(id, packet) => self.on_packet(id, packet),
                 Incoming::Datagram(from, packet) => self.on_datagram(from, packet),
                 Incoming::Closed(id) => self.on_closed(id),
@@ -746,6 +923,10 @@ impl Dispatcher {
         stop.store(true, Ordering::SeqCst);
         if let Some(socket) = &self.udp {
             wake_udp(socket);
+        }
+        // So that the other servers do not try to call this one back.
+        for link in self.directory.lock().unwrap().links.values() {
+            let _ = send_root(&link.conn, self.id, RootMsg::Bye);
         }
         for conn in self.conns.values() {
             conn.close();
@@ -902,12 +1083,13 @@ impl Dispatcher {
             }
         };
         match message {
-            RootMsg::Hello(nickname) => self.on_hello(conn_id, nickname),
-            RootMsg::PeerStart(kind, addr) if self.role.accepts(kind) => {
-                self.on_peer_start(conn_id, packet.from, kind, addr)
+            RootMsg::Hello(nickname) => self.on_hello(conn_id, nickname, None),
+            RootMsg::HelloAgain(nickname, id) => self.on_hello(conn_id, nickname, Some(id)),
+            RootMsg::PeerStart(kind, addr, nonce) if self.role.accepts(kind) => {
+                self.on_peer_start(conn_id, packet.from, kind, addr, nonce)
             }
-            RootMsg::PeerListUpdate(kind, addr) if self.role.accepts(kind) => {
-                self.on_peer_announce(conn_id, packet.from, kind, addr)
+            RootMsg::PeerListUpdate(kind, addr, nonce) if self.role.accepts(kind) => {
+                self.on_peer_announce(conn_id, packet.from, kind, addr, nonce)
             }
             other => log::warn!("ignoring first message of connection {conn_id}: {other:?}"),
         }
@@ -915,7 +1097,10 @@ impl Dispatcher {
 
     fn on_root(&mut self, source: Source, conn_id: ConnId, payload: &[u8]) {
         match RootMsg::decode(payload) {
-            Ok(RootMsg::Bye) if source.relation == Relation::Client => {
+            Ok(RootMsg::Bye) if source.relation != Relation::Client => {
+                self.departed.insert(source.id);
+            }
+            Ok(RootMsg::Bye) => {
                 self.remove_node(source.id, source.relation);
                 if let Some(conn) = self.conns.remove(&conn_id) {
                     conn.close();
@@ -954,14 +1139,24 @@ impl Dispatcher {
         }
     }
 
-    fn on_hello(&mut self, conn_id: ConnId, nickname: String) {
+    /// A client connects. One that lost its connection asks for the id it had, which it
+    /// gets if it belongs to this server and nobody has it.
+    fn on_hello(&mut self, conn_id: ConnId, nickname: String, wanted: Option<NodeId>) {
         let Some(conn) = self.conns.get(&conn_id).cloned() else {
             return;
         };
         let new_id = {
             let mut directory = self.directory.lock().unwrap();
+            let free = |id: NodeId| {
+                id & SERVER_ID_MASK == self.id
+                    && id != self.id
+                    && !directory.clients.contains_key(&id)
+            };
             let last = directory.clients.keys().next_back().copied();
-            let new_id = last.unwrap_or(self.id) + 1;
+            let new_id = match wanted {
+                Some(id) if free(id) => id,
+                _ => last.unwrap_or(self.id) + 1,
+            };
             if new_id > self.id + MAX_CLIENTS {
                 log::error!("too many clients, refusing connection");
                 conn.close();
@@ -991,13 +1186,20 @@ impl Dispatcher {
     }
 
     /// A new server wants to join the group through this one.
-    fn on_peer_start(&mut self, conn_id: ConnId, from: NodeId, kind: LinkKind, addr: PeerAddr) {
+    fn on_peer_start(
+        &mut self,
+        conn_id: ConnId,
+        from: NodeId,
+        kind: LinkKind,
+        addr: PeerAddr,
+        nonce: u64,
+    ) {
         let Some(conn) = self.conns.get(&conn_id).cloned() else {
             return;
         };
         let (id, peers) = {
             let directory = self.directory.lock().unwrap();
-            let taken = |id: NodeId| id == self.id || directory.links.contains_key(&id);
+            let taken = |id: NodeId| id == self.id || taken_by_another(&directory, id, nonce);
             let mut id = from;
             while taken(id) || !is_server_id(id) {
                 id = generate_id();
@@ -1018,27 +1220,51 @@ impl Dispatcher {
             log::info!("telling new peer that id {from:#x} is taken, use {id:#x}");
             messages.push(RootMsg::PeerChangeId(kind, id));
         }
+        messages.push(RootMsg::PeerAccepted(kind, self.nonce));
         messages.push(RootMsg::PeerList(kind, peers));
         for message in messages {
-            if let Err(e) = self.send_direct(&conn, &message) {
+            if let Err(e) = send_root(&conn, self.id, message) {
                 log::warn!("could not answer new peer: {e}");
                 return;
             }
         }
-        self.add_link(conn_id, conn, id, kind, addr);
+        self.add_link(conn_id, conn, id, kind, addr, nonce);
     }
 
     /// A server that has just joined the group connected to this one.
-    fn on_peer_announce(&mut self, conn_id: ConnId, id: NodeId, kind: LinkKind, addr: PeerAddr) {
+    fn on_peer_announce(
+        &mut self,
+        conn_id: ConnId,
+        id: NodeId,
+        kind: LinkKind,
+        addr: PeerAddr,
+        nonce: u64,
+    ) {
         let Some(conn) = self.conns.get(&conn_id).cloned() else {
             return;
         };
-        if id == self.id || !is_server_id(id) {
+        if !is_server_id(id) {
             log::error!("connection {conn_id} has an invalid server id {id:#x}");
             conn.close();
             return;
         }
-        self.add_link(conn_id, conn, id, kind, addr);
+        let taken = id == self.id || taken_by_another(&self.directory.lock().unwrap(), id, nonce);
+        let answer = if taken {
+            log::warn!("a new server has id {id:#x}, which another one has: it must change");
+            RootMsg::PeerIdTaken(kind)
+        } else {
+            RootMsg::PeerAccepted(kind, self.nonce)
+        };
+        if let Err(e) = send_root(&conn, self.id, answer) {
+            log::warn!("could not answer server {id:#x}: {e}");
+            conn.close();
+            return;
+        }
+        if taken {
+            conn.close();
+            return;
+        }
+        self.add_link(conn_id, conn, id, kind, addr, nonce);
     }
 
     fn on_dialed(
@@ -1048,30 +1274,15 @@ impl Dispatcher {
         id: NodeId,
         kind: LinkKind,
         addr: PeerAddr,
-        announce: bool,
+        nonce: u64,
     ) {
         self.conns.insert(conn_id, conn.clone());
-        if announce {
-            let message = RootMsg::PeerListUpdate(kind, advertised_addr(self.listen, &conn));
-            if let Err(e) = self.send_direct(&conn, &message) {
-                log::warn!("could not announce this server to {id:#x}: {e}");
-                return;
-            }
-        }
-        self.add_link(conn_id, conn, id, kind, addr);
+        self.add_link(conn_id, conn, id, kind, addr, nonce);
     }
 
-    /// Writes to a connection that may not belong to a known node yet.
-    fn send_direct(&self, conn: &Conn, message: &RootMsg) -> Result<()> {
-        let packet = Packet {
-            from: self.id,
-            plugin: ROOT_PLUGIN_ID,
-            targets: BTreeSet::new(),
-            payload: message.encode(),
-        };
-        conn.send(&packet.encode()?)
-    }
-
+    /// Links another server. Whoever calls it has checked that no other server has this
+    /// id, so a link with the same id is an older connection of the same server, which
+    /// the new one replaces.
     fn add_link(
         &mut self,
         conn_id: ConnId,
@@ -1079,25 +1290,17 @@ impl Dispatcher {
         id: NodeId,
         kind: LinkKind,
         addr: PeerAddr,
+        nonce: u64,
     ) {
         {
             let mut directory = self.directory.lock().unwrap();
-            if directory.links.contains_key(&id) {
-                // Two servers may connect to each other at the same time. Both
-                // keep the connection opened by the lower id. It is also how a
-                // restarted server with the same id gets back in.
-                if id > self.id {
-                    log::debug!("dropping second connection from {id:#x}");
-                    conn.close();
-                    return;
-                }
-                if let Some(old) = directory.links.remove(&id) {
-                    old.conn.close();
-                }
+            if let Some(old) = directory.links.remove(&id) {
+                log::debug!("a new connection from {id:#x} replaces the old one");
+                old.conn.close();
                 self.nodes_by_conn.retain(|_, node| node.0 != id);
             }
             let info = PeerInfo { kind, addr };
-            directory.links.insert(id, Link { conn, info });
+            directory.links.insert(id, Link { conn, info, nonce });
         }
         self.nodes_by_conn.insert(conn_id, (id, kind.into()));
         log::info!("new {kind:?} link to {id:#x}");
@@ -1116,9 +1319,74 @@ impl Dispatcher {
             conn.close();
         }
         if let Some((id, relation)) = self.nodes_by_conn.remove(&conn_id) {
+            let link = match relation {
+                Relation::Client => None,
+                _ => self
+                    .directory
+                    .lock()
+                    .unwrap()
+                    .links
+                    .get(&id)
+                    .map(|l| l.info.clone()),
+            };
             self.remove_node(id, relation);
+            if let Some(info) = link {
+                self.call_back(id, info);
+            }
         }
         self.forget_udp(conn_id);
+    }
+
+    /// The link to another server broke, but that server may still be up. Only the
+    /// one with the lower id calls back, so that the two calls do not replace each
+    /// other. What was sent while the link was down is lost.
+    fn call_back(&mut self, id: NodeId, info: PeerInfo) {
+        if self.departed.remove(&id) || self.quit || self.id > id {
+            return;
+        }
+        log::info!("lost the link to {id:#x}, calling it back");
+        let joining = Joining {
+            transport: self.transport,
+            kind: info.kind,
+            nonce: self.nonce,
+            listen: self.listen,
+        };
+        let own_id = self.id;
+        let tx = self.tx.clone();
+        let next_conn = self.next_conn.clone();
+        let stop = self.stop.clone();
+        thread::spawn(move || {
+            let deadline = Instant::now() + RECONNECT_WINDOW;
+            let mut pause = FIRST_RECONNECT_PAUSE;
+            while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(pause);
+                pause = (pause * 2).min(MAX_RECONNECT_PAUSE);
+                match joining.announce(own_id, id, &info.addr) {
+                    Ok(Some((conn, reader, nonce))) => {
+                        let conn_id = next_conn.fetch_add(1, Ordering::SeqCst);
+                        let kind = info.kind;
+                        let dialed = Incoming::Dialed {
+                            conn_id,
+                            conn,
+                            id,
+                            kind,
+                            addr: info.addr,
+                            nonce,
+                        };
+                        if tx.send(dialed).is_ok() {
+                            read_loop(reader, conn_id, tx);
+                        }
+                        return;
+                    }
+                    Ok(None) => {
+                        log::warn!("{id:#x} refused this server when it called back");
+                        return;
+                    }
+                    Err(e) => log::debug!("could not call {id:#x} back yet: {e}"),
+                }
+            }
+            log::warn!("gave up calling {id:#x} back");
+        });
     }
 
     fn remove_node(&mut self, id: NodeId, relation: Relation) {
@@ -1209,6 +1477,14 @@ impl Dispatcher {
             }
         }
     }
+}
+
+/// Whether a server other than the one with this number has the id.
+fn taken_by_another(directory: &Directory, id: NodeId, nonce: u64) -> bool {
+    directory
+        .links
+        .get(&id)
+        .is_some_and(|link| link.nonce != nonce || nonce == 0)
 }
 
 fn is_server_id(id: NodeId) -> bool {

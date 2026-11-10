@@ -71,7 +71,7 @@ impl<T: Wire + Clone> Shared<T> {
             Mode::Local => SharedMsg::CreateLocal(name.to_owned()),
             Mode::Global => SharedMsg::CreateGlobal(name.to_owned()),
         };
-        if let Err(e) = core.send_to_server(SHARED_PLUGIN_ID, msg.encode()) {
+        if let Err(e) = core.register(SHARED_PLUGIN_ID, name, msg.encode()) {
             core.state.lock().unwrap().shared.remove(name);
             return Err(e);
         }
@@ -175,6 +175,7 @@ impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
         self.core.state.lock().unwrap().shared.remove(&self.name);
         let msg = SharedMsg::Delete(self.name.clone());
+        self.core.unregister(SHARED_PLUGIN_ID, &self.name);
         let _ = self.core.send_to_server(SHARED_PLUGIN_ID, msg.encode());
     }
 }
@@ -183,6 +184,8 @@ impl<T> Drop for Shared<T> {
 struct Var {
     owners: Owners,
     last_changed: NodeId,
+    /// The client or server that the update of `last_changed` came through.
+    holder_link: NodeId,
     data: Vec<u8>,
 }
 
@@ -210,14 +213,12 @@ fn forward_sync(name: &str, origin: NodeId, links: Links, source: NodeId) -> Out
     out
 }
 
-/// A node has left: if it, or a client behind it, held the variable, let it go.
+/// A node has left: if the variable was held by it, or by anyone that this server
+/// reached through it, let it go. A client of another group comes through a gateway,
+/// with an id that does not tell which one.
 fn release(name: &str, var: &mut Var, id: NodeId, relation: Relation) -> Option<Outbound> {
     let holder = var.last_changed;
-    let held = match relation {
-        Relation::Client => holder == id,
-        Relation::Peer | Relation::Remote => holder != NOBODY_ID && holder & SERVER_ID_MASK == id,
-    };
-    if !held {
+    if holder == NOBODY_ID || var.holder_link != id {
         return None;
     }
     var.last_changed = NOBODY_ID;
@@ -247,6 +248,7 @@ impl SharedServer {
                 }
                 var.data = data;
                 var.last_changed = source.origin;
+                var.holder_link = source.id;
                 let mut out = Outbound::to_links(
                     SHARED_PLUGIN_ID,
                     payload.to_vec(),
@@ -491,6 +493,47 @@ mod tests {
         server.on_packet(peer(PEER, PEER_CLIENT), &update).unwrap();
         server.unregister_node(PEER, Relation::Peer);
         assert_eq!(server.vars["x"].last_changed, NOBODY_ID);
+    }
+
+    const GATEWAY: NodeId = 0x30000;
+    /// A client of a peer of another group, reached through `GATEWAY`.
+    const OTHER_GROUP_CLIENT: NodeId = 0x40001;
+
+    fn server_with_a_gateway() -> SharedServer {
+        let mut server = global_server();
+        let create = SharedMsg::CreateGlobal("x".into()).encode();
+        server.on_packet(remote(GATEWAY, GATEWAY), &create).unwrap();
+        server
+    }
+
+    #[test]
+    fn losing_a_gateway_releases_clients_of_other_groups() {
+        let mut server = server_with_a_gateway();
+        let msg = SharedMsg::Update("x".into(), vec![1]).encode();
+        server
+            .on_packet(remote(GATEWAY, OTHER_GROUP_CLIENT), &msg)
+            .unwrap();
+        assert_eq!(server.vars["x"].last_changed, OTHER_GROUP_CLIENT);
+
+        let out = server.unregister_node(GATEWAY, Relation::Remote);
+        assert_eq!(server.vars["x"].last_changed, NOBODY_ID);
+        // The peers of this group are told too.
+        let released = out
+            .iter()
+            .find(|o| o.from == Some(OTHER_GROUP_CLIENT))
+            .expect("a sync for the other servers");
+        assert_eq!(released.links, Links::only(LinkKind::Peer));
+        update(&mut server, HIGH, 2);
+        assert_eq!(sync(&mut server, HIGH), [2]);
+    }
+
+    #[test]
+    fn losing_one_link_keeps_holders_reached_through_another() {
+        let mut server = server_with_a_gateway();
+        let msg = SharedMsg::Update("x".into(), vec![1]).encode();
+        server.on_packet(peer(PEER, PEER_CLIENT), &msg).unwrap();
+        server.unregister_node(GATEWAY, Relation::Remote);
+        assert_eq!(server.vars["x"].last_changed, PEER_CLIENT);
     }
 
     #[test]

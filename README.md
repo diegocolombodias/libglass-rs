@@ -30,13 +30,13 @@ precisam de locks.
 
 | Tipo | Para que serve |
 |---|---|
-| `Event<T>` | Fila de mensagens entre clientes, para um nó ou para um grupo |
+| `Event<T>` | Fila de mensagens entre clientes, para um nó ou para um grupo, com o remetente de cada uma |
 | `Messenger<T>` | Mensagens ponto a ponto, em que quem recebe sabe quem enviou |
 | `Shared<T>` | Variável com um valor comum, publicado e buscado explicitamente |
 | `Remote<T>` | Variável própria de cada cliente, que os outros leem e alteram pelo id |
 | `Barrier` | Ponto de sincronização, que pode ser desativado e reativado |
 | `Alias<T>` | Valor local escolhido pelo nome que o grupo deu a este nó |
-| `Stream` | Transferência de arquivos e outros dados grandes |
+| `Stream` | Transferência de arquivos e outros dados grandes, em que quem envia fica no máximo 2 MiB à frente de quem recebe |
 | `EventSerializable` | Evento que carrega objetos de classes diferentes na mesma fila |
 | `SharedRegion` | Memória compartilhada entre processos da mesma máquina, sem rede |
 
@@ -66,7 +66,10 @@ de outro grupo vai só para os peers locais.
 
 Cada servidor tem seus próprios clientes e seu próprio master. Um servidor que entra
 depois recebe os objetos globais já existentes. Se o `seed` não responder, o servidor
-começa um grupo novo.
+começa um grupo novo. Um servidor só termina de entrar, e só então aceita clientes, depois que
+todos os servidores do grupo o aceitam. Se algum já conhece outro servidor com o id que ele
+sorteou, o que pode acontecer quando dois entram ao mesmo tempo por seeds diferentes, ele
+recomeça com outro id.
 
 ## Transportes
 
@@ -77,6 +80,8 @@ começa um grupo novo.
   dado não couber em um datagrama, tudo segue por TCP.
 - **SCTP:** `bind_sctp`, `bind_peer_sctp`, `bind_remote_peer_sctp` e `connect_sctp`, fora do
   Windows. Veja abaixo.
+- **QUIC:** `bind_quic`, `bind_peer_quic`, `bind_remote_peer_quic` e `connect_quic`, com a
+  feature `quic`. Veja abaixo.
 - **Unix sockets:** `bind_unix` e `connect_unix`, fora do Windows.
 
 ### SCTP
@@ -102,9 +107,90 @@ que não tem SCTP nativo.
   `glass_server_new_peer_sctp` e `glass_client_connect_sctp` na API em C; `sctp=True` em
   Python; e `--sctp` no `render_wall`. O UDP continua só com TCP.
 
+### QUIC
+
+Fica atrás da feature `quic`, desligada por padrão, porque traz o
+[quinn](https://github.com/quinn-rs/quinn), o rustls, o rcgen e o tokio:
+
+```toml
+libglass = { path = "...", features = ["quic"] }
+```
+
+```rust
+use libglass::{GlassClient, GlassServer, QuicIdentity, QuicTrust};
+
+// Um servidor sozinho gera um certificado autoassinado ao começar.
+let server = GlassServer::bind_quic("0.0.0.0:7001")?;
+let fingerprint = server.quic_fingerprint().unwrap(); // passar aos clientes
+let client = GlassClient::connect_quic("host1:7001", "node0", QuicTrust::Fingerprint(fingerprint))?;
+
+// Os servidores de um grupo usam o mesmo certificado.
+let identity = QuicIdentity::generate()?;
+let p1 = GlassServer::bind_peer_quic("0.0.0.0:7001", None, &identity)?;
+let p2 = GlassServer::bind_peer_quic("0.0.0.0:8001", Some("host1:7001"), &identity)?;
+```
+
+Como no SCTP, um servidor QUIC usa esse protocolo com os outros servidores e com os próprios
+clientes. Cada conexão leva um único stream bidirecional do QUIC, em ordem, como o TCP. A
+biblioteca continua síncrona: um runtime do tokio, com duas threads próprias, roda o QUIC, e as
+threads da biblioteca esperam por ele. Por isso, não use um cliente ou servidor QUIC de dentro de
+um runtime do tokio, o que causa um panic.
+
+**Segurança.** O QUIC sempre cifra a conexão, mas cifrar não basta: sem verificar o
+certificado, quem estiver no meio do caminho pode se passar pelo servidor e ler ou alterar tudo.
+
+- **Clientes:** `connect_quic` exige um `QuicTrust`. Com `QuicTrust::Fingerprint`, o cliente só
+  aceita o certificado com esse SHA-256, e o servidor precisa provar que tem a chave privada dele.
+  O fingerprint vem de `quic_fingerprint()` ou de `QuicIdentity::fingerprint()`, aparece como 64
+  dígitos hexadecimais e é lido de texto com `parse()`. Ele precisa chegar ao cliente por um
+  meio confiável. Com `QuicTrust::AnyCertificate`, o cliente aceita qualquer certificado: a
+  conexão é cifrada, mas **não há proteção contra man in the middle**. Use só em uma rede
+  confiável.
+- **Servidores:** um grupo de peers, e os gateways ligados a ele, compartilham uma
+  `QuicIdentity` (certificado e chave privada), e cada servidor só aceita esse certificado dos
+  outros. Um peer com outro certificado não entra: ele começa um grupo novo, como quando o
+  `seed` não responde. Para usar a mesma identidade em várias máquinas, salve
+  `certificate_der()` e `private_key_der()` e carregue com `QuicIdentity::from_der`. Quem tiver
+  a chave privada pode se passar por qualquer servidor do grupo.
+- **O que não há:** o servidor não autentica os clientes, assim como no TCP. Não há autoridade
+  certificadora, revogação nem troca de certificado sem reiniciar.
+
+Outros pontos:
+
+- **Desempenho:** entre dois contêineres da mesma máquina (Linux 6.6, WSL2), com 5 repetições
+  de `compare_transports --remote ... --fingerprint ...`, na mesma execução que TCP, UDP e SCTP,
+  mostrando a mediana:
+
+  | Payload | Ida e volta (ms) TCP / QUIC | Rajada (MB/s) TCP / QUIC |
+  |---|---|---|
+  | 64 B | 0,145 / 0,360 | 14,5 / 13,1 |
+  | 1 KiB | 0,134 / 0,362 | 197 / 125 |
+  | 16 KiB | 0,173 / 0,617 | 1530 / 418 |
+  | 60 KB | 0,195 / 0,846 | 2256 / 482 |
+  | 1 MiB | 2,1 / 9,5 | 1734 / 535 |
+  | 8 MiB | 49 / 102 | 460 / 334 |
+
+  O QUIC não perdeu nem reordenou nada. Ele ficou atrás do TCP em todos os casos, com uma ida e
+  volta de 2 a 4 vezes maior, mas à frente do SCTP a partir de 1 KiB (SCTP na mesma execução:
+  55, 28, 276, 310 e 182 MB/s de 1 KiB a 8 MiB), e com bem menos variação entre repetições. Não
+  foi medido de onde vem a diferença; o QUIC roda em espaço de usuário, com criptografia, e cada
+  leitura e escrita passa para as threads do runtime. O número de threads do runtime e as
+  janelas de fluxo (16 MiB) não foram ajustados por medição. Também aqui não há latência nem
+  perda de verdade na rede, onde o controle de congestionamento do QUIC poderia se comportar de
+  outro jeito.
+- **Endereços que não respondem:** como é UDP, não há recusa imediata como no TCP; uma tentativa
+  de conexão só desiste depois de 3 s. Se um nome resolver para vários endereços (por exemplo
+  `localhost` para `::1` e `127.0.0.1`) e o servidor só ouvir em um deles, a conexão pode levar
+  esse tempo a mais. Prefira o IP.
+- **Reiniciar na mesma porta:** depois que um servidor QUIC para, a porta fica ocupada enquanto
+  as conexões antigas terminam, o que levou de 100 a 150 ms nos testes. Com TCP, ela fica livre
+  na hora.
+- **Em outras partes:** `connect_retry_quic`. Ainda não há QUIC na API em C, no Python nem no
+  `render_wall`.
+
 ### Comparação
 
-O exemplo [compare_transports](examples/compare_transports.rs) mede os três protocolos pela
+O exemplo [compare_transports](examples/compare_transports.rs) mede os protocolos pela
 própria biblioteca: dois clientes trocam um `Event`, passando pelo servidor. Ele falha se TCP ou
 SCTP perderem, alterarem ou reordenarem alguma mensagem.
 
@@ -113,7 +199,8 @@ cargo run --release --example compare_transports
 ```
 
 Para medir entre máquinas, rode `compare_transports -- serve` em uma e
-`compare_transports -- --remote maquina1` em outra.
+`compare_transports -- --remote maquina1` em outra. Com `--features quic`, ele também mede o
+QUIC: o `serve` mostra o fingerprint do certificado, para passar com `--fingerprint`.
 
 Resultado com o servidor e os clientes em dois contêineres da mesma máquina, em Linux 6.6, com
 5 repetições, mostrando a mediana:
@@ -165,6 +252,7 @@ with libglass.Server() as server, libglass.Client(server.address, "a") as client
 
 ```
 cargo test --features serde
+cargo test --features serde,quic              # também os testes de QUIC
 python bindings/python/test_libglass.py       # depois de cargo build
 cargo run --example quicksort -- 100000 4
 ```
@@ -253,17 +341,12 @@ docker run --rm -v "${PWD}:/src:ro" -v "${PWD}/tests/render_wall/output:/out" ru
 
 ## Limitações
 
-- Um peer que cai não é reconectado, e um cliente também não se reconecta sozinho. O que
-  existe é `connect_retry`, para quando o servidor ainda não subiu.
-- Se a ligação entre dois gateways cair, a posse de uma variável `Shared` por um cliente
-  do outro grupo fica presa até o fim do servidor, e clientes de id maior não conseguem
-  mais alterá-la.
-- Dois servidores que entram por seeds diferentes ao mesmo tempo podem escolher o mesmo
-  id. O conflito é detectado na conexão entre eles, mas não corrigido.
-- `Stream` não tem controle de fluxo: quem recebe guarda os dados em memória até chamar
-  `receive`, e quem envia pode ficar muito à frente.
-- Um cliente não sabe quem enviou um `Event`, porque o servidor grava o próprio id. Para
-  saber o remetente, use `Messenger`.
+- Quando a ligação entre dois servidores cai sem que eles tenham saído, o de menor id tenta
+  refazê-la por até 30 s. O que foi enviado enquanto ela estava fora se perde.
+- Um cliente só se reconecta sozinho se pedir, com `set_reconnect`. Ele recupera o id se o
+  servidor ainda o tiver livre, o que inclui um servidor reiniciado no mesmo endereço, desde
+  que não seja um peer, cujo id é sorteado. O que foi enviado enquanto ele estava fora e o
+  que só o servidor guardava, como associações de `Alias`, se perdem, e o UDP não volta.
 - Em `Shared`, um cliente de id menor tem prioridade sobre os de id maior até chamar
   `get_update`. O resultado é o mesmo em todos os servidores, mas o critério merece ser
   redesenhado.

@@ -7,6 +7,7 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::io::{self, Read};
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread;
@@ -280,6 +281,178 @@ fn stream_reports_a_failed_transfer_on_both_sides() {
     assert_eq!(received, [1, 2]);
 }
 
+const CHUNK: usize = 256 * 1024;
+const WINDOW: usize = 8;
+
+/// A long pattern, which tells how much of it has been read.
+struct Pattern {
+    len: usize,
+    position: Arc<AtomicUsize>,
+}
+
+impl Pattern {
+    fn new(len: usize) -> Pattern {
+        Pattern {
+            len,
+            position: Arc::default(),
+        }
+    }
+
+    fn byte(i: usize) -> u8 {
+        (i % 251) as u8
+    }
+}
+
+impl Read for Pattern {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let start = self.position.load(Ordering::SeqCst);
+        let n = buf.len().min(self.len - start);
+        for (i, byte) in buf[..n].iter_mut().enumerate() {
+            *byte = Pattern::byte(start + i);
+        }
+        self.position.store(start + n, Ordering::SeqCst);
+        Ok(n)
+    }
+}
+
+/// Checks that what is written is the pattern, without keeping it, and can fail.
+#[derive(Default)]
+struct PatternCheck {
+    written: usize,
+    fail_after: Option<usize>,
+}
+
+impl io::Write for PatternCheck {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.fail_after.is_some_and(|limit| self.written >= limit) {
+            return Err(io::Error::other("disk full"));
+        }
+        for (i, &byte) in buf.iter().enumerate() {
+            assert_eq!(byte, Pattern::byte(self.written + i), "wrong byte");
+        }
+        self.written += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn stream_sender_waits_for_the_receiver() {
+    let (_server, addr) = start_server();
+    let a = GlassClient::connect(addr, "a").unwrap();
+    let b = GlassClient::connect(addr, "b").unwrap();
+    let s_a = Stream::new(&a, "s", Mode::Local).unwrap();
+    let s_b = Stream::new(&b, "s", Mode::Local).unwrap();
+    thread::sleep(SETTLE);
+
+    let len = 40 * 1024 * 1024;
+    let mut source = Pattern::new(len);
+    let position = source.position.clone();
+    thread::scope(|scope| {
+        let sender = scope.spawn(|| s_a.send_from(b.id(), &mut source).unwrap());
+        thread::sleep(Duration::from_secs(1));
+        // The window, and the chunk it read while waiting for room.
+        let read = position.load(Ordering::SeqCst);
+        assert!(read <= (WINDOW + 1) * CHUNK, "it read {read} bytes ahead");
+
+        let mut check = PatternCheck::default();
+        let (from, size) = s_b.receive(&mut check, TIMEOUT).unwrap();
+        assert_eq!((from, size), (a.id(), len as u64));
+        assert_eq!(check.written, len);
+        assert_eq!(sender.join().unwrap(), len as u64);
+    });
+}
+
+#[test]
+fn stream_sender_gives_up_if_nobody_receives() {
+    let (_server, addr) = start_server();
+    let a = GlassClient::connect(addr, "a").unwrap();
+    let b = GlassClient::connect(addr, "b").unwrap();
+    let s_a = Stream::new(&a, "s", Mode::Local).unwrap();
+    let s_b = Stream::new(&b, "s", Mode::Local).unwrap();
+    thread::sleep(SETTLE);
+
+    s_a.set_send_timeout(SHORT);
+    let start = Instant::now();
+    let result = s_a.send_from(b.id(), &mut Pattern::new(10 * 1024 * 1024));
+    assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+    assert!(start.elapsed() < TIMEOUT);
+
+    // The receiver gets what was sent, and then learns that it failed.
+    let mut check = PatternCheck::default();
+    assert!(matches!(
+        s_b.receive(&mut check, TIMEOUT),
+        Err(Error::TransferAborted)
+    ));
+    assert_eq!(check.written, WINDOW * CHUNK);
+
+    s_a.send_from(b.id(), &mut [7u8].as_slice()).unwrap();
+    let mut received = Vec::new();
+    assert_eq!(s_b.receive(&mut received, TIMEOUT).unwrap(), (a.id(), 1));
+    assert_eq!(received, [7]);
+}
+
+#[test]
+fn stream_receiver_that_fails_stops_the_sender() {
+    let (_server, addr) = start_server();
+    let a = GlassClient::connect(addr, "a").unwrap();
+    let b = GlassClient::connect(addr, "b").unwrap();
+    let s_a = Stream::new(&a, "s", Mode::Local).unwrap();
+    let s_b = Stream::new(&b, "s", Mode::Local).unwrap();
+    thread::sleep(SETTLE);
+
+    thread::scope(|scope| {
+        let sender = scope.spawn(|| s_a.send_from(b.id(), &mut Pattern::new(50 * 1024 * 1024)));
+        let mut failing = PatternCheck {
+            fail_after: Some(3 * CHUNK),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s_b.receive(&mut failing, TIMEOUT),
+            Err(Error::Io(_))
+        ));
+        let result = sender.join().unwrap();
+        assert!(matches!(result, Err(Error::TransferAborted)), "{result:?}");
+    });
+
+    // What was still on the way is dropped, and the next transfer arrives clean.
+    s_a.send_from(b.id(), &mut [1u8, 2, 3].as_slice()).unwrap();
+    let mut received = Vec::new();
+    assert_eq!(s_b.receive(&mut received, TIMEOUT).unwrap(), (a.id(), 3));
+    assert_eq!(received, [1, 2, 3]);
+}
+
+#[test]
+fn stream_sends_and_receives_at_once_in_both_directions() {
+    let (_server, addr) = start_server();
+    let a = GlassClient::connect(addr, "a").unwrap();
+    let b = GlassClient::connect(addr, "b").unwrap();
+    let s_a = Stream::new(&a, "s", Mode::Local).unwrap();
+    let s_b = Stream::new(&b, "s", Mode::Local).unwrap();
+    thread::sleep(SETTLE);
+
+    let len = 12 * 1024 * 1024;
+    thread::scope(|scope| {
+        let a_sends = scope.spawn(|| s_a.send_from(b.id(), &mut Pattern::new(len)).unwrap());
+        let b_sends = scope.spawn(|| s_b.send_from(a.id(), &mut Pattern::new(len)).unwrap());
+        let a_receives = scope.spawn(|| {
+            let mut check = PatternCheck::default();
+            s_a.receive(&mut check, TIMEOUT).unwrap()
+        });
+        let mut check = PatternCheck::default();
+        assert_eq!(
+            s_b.receive(&mut check, TIMEOUT).unwrap(),
+            (a.id(), len as u64)
+        );
+        assert_eq!(a_receives.join().unwrap(), (b.id(), len as u64));
+        assert_eq!(a_sends.join().unwrap(), len as u64);
+        assert_eq!(b_sends.join().unwrap(), len as u64);
+    });
+}
+
 #[test]
 fn stream_with_nothing_to_receive_times_out() {
     let (_server, addr) = start_server();
@@ -502,7 +675,7 @@ fn events_can_travel_through_udp() {
 
     let before = server.datagrams_received();
     ev_a.enqueue_unreliable(&7, EVERYBODY_ID).unwrap();
-    assert_eq!(ev_b.get_timeout(TIMEOUT).unwrap(), 7);
+    assert_eq!(ev_b.get_with_sender_timeout(TIMEOUT).unwrap(), (a.id(), 7));
     assert_eq!(
         server.datagrams_received(),
         before + 1,

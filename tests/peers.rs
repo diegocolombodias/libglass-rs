@@ -4,9 +4,10 @@
 use libglass::packet::Packet;
 use libglass::protocol::{PeerAddr, RootMsg};
 use libglass::*;
-use std::collections::BTreeSet;
-use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -102,6 +103,39 @@ fn each_server_has_its_own_clients_and_master() {
     assert_eq!(b.total_nodes(), 2);
     assert_eq!(p1.client_list().len(), 2);
     assert_eq!(p2.client_list().len(), 1);
+}
+
+#[test]
+fn events_tell_who_sent_them_across_peers() {
+    let (p1, _p2, a, b) = two_peers();
+    let a2 = client(&p1, "a2");
+    let events: Vec<Event<i32>> = [&a, &b, &a2]
+        .iter()
+        .map(|c| Event::new(c, "ev", Mode::Global).unwrap())
+        .collect();
+    thread::sleep(SETTLE);
+
+    // From another server, from the same server, and to itself.
+    events[0].enqueue(&1, EVERYBODY_ID, true).unwrap();
+    assert_eq!(
+        events[1].get_with_sender_timeout(TIMEOUT).unwrap(),
+        (a.id(), 1)
+    );
+    assert_eq!(
+        events[2].get_with_sender_timeout(TIMEOUT).unwrap(),
+        (a.id(), 1)
+    );
+    assert_eq!(
+        events[0].get_with_sender_timeout(TIMEOUT).unwrap(),
+        (a.id(), 1)
+    );
+
+    events[1].enqueue(&2, a2.id(), false).unwrap();
+    assert_eq!(
+        events[2].get_with_sender_timeout(TIMEOUT).unwrap(),
+        (b.id(), 2)
+    );
+    assert!(events[0].try_get_with_sender().unwrap().is_none());
 }
 
 /// Based on `autopeereventtest.cpp`.
@@ -530,6 +564,47 @@ fn gateways_connect_groups() {
     }
 }
 
+/// A client of one group holds a shared variable, and the link to its group breaks.
+#[test]
+fn losing_a_gateway_releases_variables_held_through_it() {
+    let g1 = group(None, "c1");
+    let g2 = group(Some(&g1.gateway), "c2");
+    wait_until("the gateways connect", || {
+        g1.gateway.peers().len() == 2 && g2.gateway.peers().len() == 2
+    });
+    // Only a lower id holds the variable against another client.
+    let (holder, other) = if g1.client.id() < g2.client.id() {
+        (g1, g2)
+    } else {
+        (g2, g1)
+    };
+    let held = Shared::new(&holder.client, "x", 0, Mode::Global).unwrap();
+    let wanted = Shared::new(&other.client, "x", 0, Mode::Global).unwrap();
+    thread::sleep(SETTLE);
+
+    // It is held while its client does not call get_update.
+    held.set(1);
+    held.send_update().unwrap();
+    wait_until("the other group sees it", || {
+        wanted.get_update().unwrap();
+        wanted.get() == 1
+    });
+    wanted.set(2);
+    wanted.send_update().unwrap();
+    wanted.get_update().unwrap();
+    assert_eq!(wanted.get(), 1, "the variable should be held");
+
+    let Group { gateway, .. } = holder;
+    drop(gateway);
+    wait_until("the link is gone", || other.gateway.peers().len() == 1);
+    wait_until("the variable is released", || {
+        wanted.set(2);
+        wanted.send_update().unwrap();
+        wanted.get_update().unwrap();
+        wanted.get() == 2
+    });
+}
+
 #[test]
 fn local_objects_stay_in_the_server_even_with_gateways() {
     let g1 = group(None, "c1");
@@ -567,6 +642,33 @@ fn fake_addr() -> PeerAddr {
     }
 }
 
+/// The numbers that fake servers drew when they started.
+const NONCE_X: u64 = 0x1111;
+const NONCE_Y: u64 = 0x2222;
+
+/// Reads the answer to `PeerStart`, up to the list of servers.
+fn read_list(stream: &mut TcpStream) -> BTreeMap<NodeId, PeerAddr> {
+    loop {
+        match read_root(stream).1 {
+            RootMsg::PeerList(_, list) => return list,
+            RootMsg::PeerAccepted(..) | RootMsg::PeerChangeId(..) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+fn assert_closed(stream: &mut TcpStream, what: &str) {
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    loop {
+        match Packet::read_from(stream) {
+            Ok(None) | Err(_) => return,
+            // Anything the server sent before closing it.
+            Ok(Some(_)) => {}
+        }
+        assert!(stream.peer_addr().is_ok(), "{what}");
+    }
+}
+
 fn connect(server: &GlassServer) -> TcpStream {
     let addr: SocketAddr = server.local_addr();
     TcpStream::connect(addr).unwrap()
@@ -580,7 +682,7 @@ fn new_peer_with_an_id_in_use_is_told_to_change_it() {
     send_root(
         &mut raw,
         peer.id(),
-        RootMsg::PeerStart(LinkKind::Peer, fake_addr()),
+        RootMsg::PeerStart(LinkKind::Peer, fake_addr(), NONCE_X),
     );
     let (_, message) = read_root(&mut raw);
     let RootMsg::PeerChangeId(LinkKind::Peer, new_id) = message else {
@@ -588,6 +690,11 @@ fn new_peer_with_an_id_in_use_is_told_to_change_it() {
     };
     assert_ne!(new_id, peer.id());
 
+    let (_, message) = read_root(&mut raw);
+    assert!(
+        matches!(message, RootMsg::PeerAccepted(LinkKind::Peer, nonce) if nonce != 0),
+        "expected the acceptance, with the number of the server, got {message:?}"
+    );
     let (from, message) = read_root(&mut raw);
     assert_eq!(from, peer.id());
     let RootMsg::PeerList(LinkKind::Peer, list) = message else {
@@ -608,17 +715,17 @@ fn second_new_peer_with_the_same_id_is_also_told() {
     send_root(
         &mut first,
         taken,
-        RootMsg::PeerStart(LinkKind::Peer, fake_addr()),
+        RootMsg::PeerStart(LinkKind::Peer, fake_addr(), NONCE_X),
     );
-    let (_, message) = read_root(&mut first);
-    assert!(matches!(message, RootMsg::PeerList(..)));
+    read_list(&mut first);
     wait_until("the first is registered", || peer.peers().len() == 1);
 
+    // Another server, as it drew another number.
     let mut second = connect(&peer);
     send_root(
         &mut second,
         taken,
-        RootMsg::PeerStart(LinkKind::Peer, fake_addr()),
+        RootMsg::PeerStart(LinkKind::Peer, fake_addr(), NONCE_Y),
     );
     let (_, message) = read_root(&mut second);
     assert!(matches!(message, RootMsg::PeerChangeId(..)));
@@ -635,12 +742,9 @@ fn peer_list_tells_the_new_peer_about_the_others() {
     send_root(
         &mut raw,
         0x7FFF_0000,
-        RootMsg::PeerStart(LinkKind::Peer, fake_addr()),
+        RootMsg::PeerStart(LinkKind::Peer, fake_addr(), NONCE_X),
     );
-    let (_, message) = read_root(&mut raw);
-    let RootMsg::PeerList(_, list) = message else {
-        panic!("expected the list, got {message:?}");
-    };
+    let list = read_list(&mut raw);
     assert_eq!(
         list.keys().copied().collect::<BTreeSet<_>>(),
         BTreeSet::from([p1.id(), p2.id()])
@@ -656,7 +760,7 @@ fn plain_server_rejects_peers() {
     send_root(
         &mut raw,
         0x7FFF_0000,
-        RootMsg::PeerStart(LinkKind::Peer, fake_addr()),
+        RootMsg::PeerStart(LinkKind::Peer, fake_addr(), NONCE_X),
     );
     thread::sleep(SETTLE);
     assert!(server.peers().is_empty());
@@ -669,7 +773,7 @@ fn peer_rejects_remote_peers_but_gateway_accepts_them() {
     send_root(
         &mut raw,
         0x7FFF_0000,
-        RootMsg::PeerStart(LinkKind::Remote, fake_addr()),
+        RootMsg::PeerStart(LinkKind::Remote, fake_addr(), NONCE_X),
     );
     thread::sleep(SETTLE);
     assert!(peer.peers().is_empty());
@@ -679,10 +783,9 @@ fn peer_rejects_remote_peers_but_gateway_accepts_them() {
     send_root(
         &mut raw,
         0x7FFF_0000,
-        RootMsg::PeerStart(LinkKind::Remote, fake_addr()),
+        RootMsg::PeerStart(LinkKind::Remote, fake_addr(), NONCE_X),
     );
-    let (_, message) = read_root(&mut raw);
-    assert!(matches!(message, RootMsg::PeerList(LinkKind::Remote, _)));
+    read_list(&mut raw);
     wait_until("the gateway registers it", || {
         gateway
             .peers()
@@ -699,75 +802,154 @@ fn announce_with_an_invalid_id_is_rejected() {
         send_root(
             &mut raw,
             bad_id,
-            RootMsg::PeerListUpdate(LinkKind::Peer, fake_addr()),
+            RootMsg::PeerListUpdate(LinkKind::Peer, fake_addr(), NONCE_X),
         );
     }
     thread::sleep(SETTLE);
     assert!(peer.peers().is_empty());
 }
 
+fn announce(server: &GlassServer, id: NodeId, nonce: u64) -> (TcpStream, RootMsg) {
+    let mut stream = connect(server);
+    let update = RootMsg::PeerListUpdate(LinkKind::Peer, fake_addr(), nonce);
+    send_root(&mut stream, id, update);
+    let (_, answer) = read_root(&mut stream);
+    (stream, answer)
+}
+
 #[test]
-fn second_connection_from_a_known_peer_keeps_the_one_from_the_lower_id() {
+fn a_new_connection_from_the_same_server_replaces_the_old_one() {
     let peer = first_peer();
-    let higher = 0xFFFF_0000;
-    assert!(higher > peer.id());
+    let id = 0x7FFF_0000;
 
-    // From a higher id: the first connection stays, the second is closed.
-    let mut first = connect(&peer);
-    send_root(
-        &mut first,
-        higher,
-        RootMsg::PeerListUpdate(LinkKind::Peer, fake_addr()),
-    );
-    wait_until("registered", || peer.peers().contains_key(&higher));
-    let mut second = connect(&peer);
-    send_root(
-        &mut second,
-        higher,
-        RootMsg::PeerListUpdate(LinkKind::Peer, fake_addr()),
-    );
-    second.set_read_timeout(Some(TIMEOUT)).unwrap();
-    let closed = Packet::read_from(&mut second);
-    assert!(
-        matches!(closed, Ok(None) | Err(_)),
-        "the second connection must be closed"
-    );
+    let (mut first, answer) = announce(&peer, id, NONCE_X);
+    assert!(matches!(answer, RootMsg::PeerAccepted(LinkKind::Peer, n) if n != 0));
+    wait_until("registered", || peer.peers().contains_key(&id));
 
-    // Still there, because the first connection was not affected.
-    thread::sleep(SHORT);
-    assert!(peer.peers().contains_key(&higher));
-
-    // From a lower id: the new connection replaces the first, which is closed.
-    let lower = BASE_SERVER_ID;
-    assert!(lower < peer.id());
-    let mut first = connect(&peer);
-    send_root(
-        &mut first,
-        lower,
-        RootMsg::PeerListUpdate(LinkKind::Peer, fake_addr()),
-    );
-    wait_until("registered", || peer.peers().contains_key(&lower));
-    let mut second = connect(&peer);
-    send_root(
-        &mut second,
-        lower,
-        RootMsg::PeerListUpdate(LinkKind::Peer, fake_addr()),
-    );
-    first.set_read_timeout(Some(TIMEOUT)).unwrap();
-    let closed = Packet::read_from(&mut first);
-    assert!(
-        matches!(closed, Ok(None) | Err(_)),
-        "the first connection must be closed"
-    );
+    // The same server, with the same number: a new connection, which replaces the old.
+    let (second, answer) = announce(&peer, id, NONCE_X);
+    assert!(matches!(answer, RootMsg::PeerAccepted(..)));
+    assert_closed(&mut first, "the first connection must be closed");
     thread::sleep(SHORT);
     assert!(
-        peer.peers().contains_key(&lower),
+        peer.peers().contains_key(&id),
         "replacing a connection must not remove the peer"
     );
 
+    // Another server with that id is refused, and the first one stays.
+    let (mut other, answer) = announce(&peer, id, NONCE_Y);
+    assert_eq!(answer, RootMsg::PeerIdTaken(LinkKind::Peer));
+    assert_closed(&mut other, "the refused connection must be closed");
+    thread::sleep(SHORT);
+    assert!(peer.peers().contains_key(&id));
+
     // And the node only leaves when the connection in use closes.
     drop(second);
-    wait_until("the peer is removed", || !peer.peers().contains_key(&lower));
+    wait_until("the peer is removed", || !peer.peers().contains_key(&id));
+}
+
+/// Two new servers drew the same id, and each one started through a different server of
+/// the group, which did not know about the other yet.
+#[test]
+fn servers_joining_at_once_with_the_same_id_are_told_to_change() {
+    let p1 = first_peer();
+    let p2 = join(&p1);
+    wait_for_mesh(&[&p1, &p2]);
+    let same = 0x7FFF_0000;
+
+    let mut x_start = connect(&p1);
+    send_root(
+        &mut x_start,
+        same,
+        RootMsg::PeerStart(LinkKind::Peer, fake_addr(), NONCE_X),
+    );
+    read_list(&mut x_start);
+    let mut y_start = connect(&p2);
+    send_root(
+        &mut y_start,
+        same,
+        RootMsg::PeerStart(LinkKind::Peer, fake_addr(), NONCE_Y),
+    );
+    read_list(&mut y_start);
+
+    // Each one then announces itself to the server where the other one started.
+    let (mut x_announce, answer) = announce(&p2, same, NONCE_X);
+    assert_eq!(answer, RootMsg::PeerIdTaken(LinkKind::Peer));
+    assert_closed(&mut x_announce, "the refused connection must be closed");
+    let (mut y_announce, answer) = announce(&p1, same, NONCE_Y);
+    assert_eq!(answer, RootMsg::PeerIdTaken(LinkKind::Peer));
+    assert_closed(&mut y_announce, "the refused connection must be closed");
+
+    // Until they leave, each server keeps the one that started through it.
+    assert!(p1.peers().contains_key(&same) && p2.peers().contains_key(&same));
+    drop((x_start, y_start));
+    wait_until("they leave", || {
+        !p1.peers().contains_key(&same) && !p2.peers().contains_key(&same)
+    });
+}
+
+/// A real server joins a fake group, where a server other than the seed already knows
+/// another server with the id it drew.
+#[test]
+fn joining_server_starts_over_with_another_id_if_its_id_is_taken() {
+    let seed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (seed_id, other_id) = (0x0011_0000, 0x0022_0000);
+    let address = |listener: &TcpListener| PeerAddr {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+    };
+    let list = BTreeMap::from([(seed_id, address(&seed)), (other_id, address(&other))]);
+    let seed_addr = seed.local_addr().unwrap().to_string();
+
+    let fake_group = thread::spawn(move || {
+        let mut ids = Vec::new();
+        for attempt in 0..2 {
+            let (mut start, _) = seed.accept().unwrap();
+            let (id, message) = read_root(&mut start);
+            assert!(matches!(message, RootMsg::PeerStart(LinkKind::Peer, _, n) if n != 0));
+            ids.push(id);
+            send_root(
+                &mut start,
+                seed_id,
+                RootMsg::PeerAccepted(LinkKind::Peer, 1),
+            );
+            send_root(
+                &mut start,
+                seed_id,
+                RootMsg::PeerList(LinkKind::Peer, list.clone()),
+            );
+
+            let (mut update, _) = other.accept().unwrap();
+            let (from, message) = read_root(&mut update);
+            assert_eq!(from, id);
+            assert!(matches!(
+                message,
+                RootMsg::PeerListUpdate(LinkKind::Peer, _, _)
+            ));
+            if attempt == 0 {
+                send_root(&mut update, other_id, RootMsg::PeerIdTaken(LinkKind::Peer));
+                assert_closed(&mut start, "it must leave the seed before starting over");
+            } else {
+                send_root(
+                    &mut update,
+                    other_id,
+                    RootMsg::PeerAccepted(LinkKind::Peer, 2),
+                );
+                return (ids, start, update);
+            }
+        }
+        unreachable!()
+    });
+
+    let server = GlassServer::bind_peer("127.0.0.1:0", Some(&seed_addr)).unwrap();
+    let (ids, _start, _update) = fake_group.join().unwrap();
+    assert_ne!(ids[0], ids[1], "it must try another id");
+    assert_eq!(server.id(), ids[1]);
+    wait_until("both links are made", || {
+        let peers = server.peers();
+        peers.contains_key(&seed_id) && peers.contains_key(&other_id)
+    });
 }
 
 #[test]
@@ -868,4 +1050,99 @@ fn malformed_peer_messages_do_not_affect_a_server() {
     thread::sleep(SETTLE);
     assert!(peer.peers().is_empty());
     assert!(a.is_connected());
+}
+
+/// Forwards the connections it gets to another address, until they are cut.
+struct Proxy {
+    addr: SocketAddr,
+    sockets: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Proxy {
+    fn new(target: SocketAddr) -> Proxy {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sockets = Arc::<Mutex<Vec<TcpStream>>>::default();
+        let kept = sockets.clone();
+        thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let (Ok(inside), Ok(outside)) = (incoming, TcpStream::connect(target)) else {
+                    return;
+                };
+                let mut kept = kept.lock().unwrap();
+                kept.push(inside.try_clone().unwrap());
+                kept.push(outside.try_clone().unwrap());
+                pipe(inside.try_clone().unwrap(), outside.try_clone().unwrap());
+                pipe(outside, inside);
+            }
+        });
+        Proxy { addr, sockets }
+    }
+
+    /// Breaks the connections, as a failure of the network would, while both ends
+    /// keep running.
+    fn cut(&self) {
+        for socket in self.sockets.lock().unwrap().drain(..) {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+fn pipe(mut from: TcpStream, mut to: TcpStream) {
+    thread::spawn(move || {
+        let _ = io::copy(&mut from, &mut to);
+        let _ = to.shutdown(Shutdown::Both);
+    });
+}
+
+#[test]
+fn peers_reconnect_after_their_link_breaks() {
+    let p1 = first_peer();
+    let proxy = Proxy::new(p1.local_addr());
+    // The second one joins through the proxy, which then carries the link between them.
+    let p2 = GlassServer::bind_peer("127.0.0.1:0", Some(&proxy.addr.to_string())).unwrap();
+    wait_for_mesh(&[&p1, &p2]);
+    let a = client(&p1, "a");
+    let b = client(&p2, "b");
+    let ev_a = Event::<i32>::new(&a, "ev", Mode::Global).unwrap();
+    let ev_b = Event::<i32>::new(&b, "ev", Mode::Global).unwrap();
+    thread::sleep(SETTLE);
+    ev_a.enqueue(&1, EVERYBODY_ID, false).unwrap();
+    assert_eq!(ev_b.get_timeout(TIMEOUT).unwrap(), 1);
+
+    proxy.cut();
+    // The one with the lower id calls the other back, without the proxy, and the
+    // objects are known on both sides again.
+    wait_until("events cross again", || {
+        ev_a.enqueue(&2, EVERYBODY_ID, false).unwrap();
+        matches!(ev_b.get_timeout(SHORT), Ok(2))
+    });
+    ev_b.enqueue(&3, EVERYBODY_ID, false).unwrap();
+    assert_eq!(ev_a.get_timeout(TIMEOUT).unwrap(), 3);
+    assert_eq!(p1.peers().len(), 1);
+    assert_eq!(p2.peers().len(), 1);
+}
+
+#[test]
+fn a_peer_that_leaves_on_purpose_is_not_called_back() {
+    let p1 = first_peer();
+    let p2 = join(&p1);
+    wait_for_mesh(&[&p1, &p2]);
+    // Only the one with the lower id would call the other back.
+    let (stays, leaves) = if p1.id() < p2.id() {
+        (p1, p2)
+    } else {
+        (p2, p1)
+    };
+    let addr = leaves.local_addr();
+    drop(leaves);
+    wait_until("it leaves", || stays.peers().is_empty());
+
+    let listener = TcpListener::bind(addr).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        listener.accept().is_err(),
+        "it called back the server that left"
+    );
 }

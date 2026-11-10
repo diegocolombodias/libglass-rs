@@ -13,6 +13,11 @@ bincode = { version = "1", optional = true }
 log = "0.4"
 memmap2 = "0.9"
 serde = { version = "1", optional = true }
+quinn = { version = "0.11", optional = true, default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["crypto", "ring"] }
+ring = { version = "0.17", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", optional = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 socket2 = "0.6"
@@ -23,6 +28,8 @@ libc = "0.2"
 [features]
 # Adds `Serde<T>`, to send any type that implements serde's traits.
 serde = ["dep:serde", "dep:bincode"]
+# Adds QUIC, through quinn and rustls, with a tokio runtime on background threads.
+quic = ["dep:quinn", "dep:rcgen", "dep:ring", "dep:rustls", "dep:tokio"]
 
 [dev-dependencies]
 glow = "0.18"

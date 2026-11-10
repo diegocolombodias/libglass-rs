@@ -73,6 +73,7 @@ _declare("server_wait", c_int, c_void_p)
 _declare("server_free", None, c_void_p)
 _declare("client_connect", c_void_p, c_char_p, c_char_p)
 _declare("client_connect_sctp", c_void_p, c_char_p, c_char_p)
+_declare("client_set_reconnect", None, c_void_p, c_uint64)
 _declare("client_id", c_uint32, c_void_p)
 _declare("client_is_master", c_int, c_void_p)
 _declare("client_is_connected", c_int, c_void_p)
@@ -82,6 +83,15 @@ _declare("client_free", None, c_void_p)
 _declare("event_new", c_void_p, c_void_p, c_char_p, c_int)
 _declare("event_enqueue", c_int, c_void_p, c_char_p, c_size_t, c_uint32, c_int)
 _declare("event_get", c_int, c_void_p, c_uint64, POINTER(_Bytes), POINTER(c_size_t))
+_declare(
+    "event_get_with_sender",
+    c_int,
+    c_void_p,
+    c_uint64,
+    POINTER(c_uint32),
+    POINTER(_Bytes),
+    POINTER(c_size_t),
+)
 _declare("event_queue_size", c_size_t, c_void_p)
 _declare("event_free", None, c_void_p)
 _declare("shared_new", c_void_p, c_void_p, c_char_p, c_char_p, c_size_t, c_int)
@@ -199,6 +209,10 @@ class Client(_Object):
         connect = _lib.glass_client_connect_sctp if sctp else _lib.glass_client_connect
         self._pointer = _created(connect(addr.encode(), nickname.encode()))
 
+    def set_reconnect(self, window=None):
+        """Connect again when the server is lost, trying for up to `window` seconds."""
+        _lib.glass_client_set_reconnect(self._pointer, _millis(window) if window else 0)
+
     @property
     def id(self):
         return _lib.glass_client_id(self._pointer)
@@ -230,6 +244,14 @@ class Event(_Object):
 
     def get(self, timeout=10.0):
         return _take(_lib.glass_event_get, self._pointer, _millis(timeout))
+
+    def get_with_sender(self, timeout=10.0):
+        """Gives the client that sent the event, and the data."""
+        sender = c_uint32()
+        data = _take(
+            _lib.glass_event_get_with_sender, self._pointer, _millis(timeout), byref(sender)
+        )
+        return sender.value, data
 
     def __len__(self):
         return _lib.glass_event_queue_size(self._pointer)

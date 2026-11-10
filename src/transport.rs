@@ -1,9 +1,11 @@
 //! The stream connections the library can run on.
 
+#[cfg(feature = "quic")]
+use crate::quic::{self, QuicIdentity, QuicListener, QuicStream, QuicTrust};
 #[cfg(unix)]
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, ErrorKind, Read, Write};
-#[cfg(unix)]
+#[cfg(any(unix, feature = "quic"))]
 use std::net::SocketAddr;
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -31,6 +33,9 @@ pub(crate) enum Transport {
     Tcp,
     #[cfg(unix)]
     Sctp,
+    /// With what the server must present.
+    #[cfg(feature = "quic")]
+    Quic(QuicTrust),
 }
 
 impl Transport {
@@ -44,6 +49,10 @@ impl Transport {
                 }
                 #[cfg(unix)]
                 Transport::Sctp => connect_sctp(addr).map(Stream::Sctp),
+                #[cfg(feature = "quic")]
+                Transport::Quic(trust) => {
+                    quic::connect(addr, trust, CONNECT_TIMEOUT).map(Stream::Quic)
+                }
             };
             match stream {
                 Ok(stream) => return Ok(stream),
@@ -111,6 +120,8 @@ pub(crate) enum Stream {
     Sctp(Socket),
     #[cfg(unix)]
     Unix(UnixStream),
+    #[cfg(feature = "quic")]
+    Quic(QuicStream),
 }
 
 impl Stream {
@@ -121,6 +132,8 @@ impl Stream {
             Stream::Sctp(s) => s.try_clone().map(Stream::Sctp),
             #[cfg(unix)]
             Stream::Unix(s) => s.try_clone().map(Stream::Unix),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => Ok(Stream::Quic(s.clone())),
         }
     }
 
@@ -131,6 +144,8 @@ impl Stream {
             Stream::Sctp(s) => s.set_read_timeout(timeout),
             #[cfg(unix)]
             Stream::Unix(s) => s.set_read_timeout(timeout),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.set_read_timeout(timeout),
         }
     }
 
@@ -141,6 +156,8 @@ impl Stream {
             Stream::Sctp(s) => s.set_write_timeout(timeout),
             #[cfg(unix)]
             Stream::Unix(s) => s.set_write_timeout(timeout),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.set_write_timeout(timeout),
         }
     }
 
@@ -151,10 +168,13 @@ impl Stream {
             Stream::Sctp(s) => s.shutdown(Shutdown::Both),
             #[cfg(unix)]
             Stream::Unix(s) => s.shutdown(Shutdown::Both),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.shutdown(),
         }
     }
 
-    /// Sends small packets right away. It does not apply to Unix sockets.
+    /// Sends small packets right away. It does not apply to Unix sockets, nor to QUIC,
+    /// which already does.
     pub(crate) fn set_nodelay(&self) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_nodelay(true),
@@ -162,6 +182,8 @@ impl Stream {
             Stream::Sctp(s) => set_sctp_nodelay(s),
             #[cfg(unix)]
             Stream::Unix(_) => Ok(()),
+            #[cfg(feature = "quic")]
+            Stream::Quic(_) => Ok(()),
         }
     }
 }
@@ -174,6 +196,8 @@ impl Read for Stream {
             Stream::Sctp(s) => s.read(buf),
             #[cfg(unix)]
             Stream::Unix(s) => s.read(buf),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.read(buf),
         }
     }
 }
@@ -186,6 +210,8 @@ impl Write for Stream {
             Stream::Sctp(s) => s.write(&buf[..buf.len().min(SCTP_MAX_WRITE)]),
             #[cfg(unix)]
             Stream::Unix(s) => s.write(buf),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.write(buf),
         }
     }
 
@@ -196,6 +222,8 @@ impl Write for Stream {
             Stream::Sctp(s) => s.flush(),
             #[cfg(unix)]
             Stream::Unix(s) => s.flush(),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.flush(),
         }
     }
 }
@@ -216,6 +244,8 @@ pub(crate) enum Listener {
     Sctp(Socket),
     #[cfg(unix)]
     Unix(UnixListener),
+    #[cfg(feature = "quic")]
+    Quic(QuicListener),
 }
 
 impl Listener {
@@ -235,6 +265,16 @@ impl Listener {
         Err(last_error.unwrap_or_else(|| ErrorKind::NotFound.into()))
     }
 
+    /// Listens for QUIC on the first address that works, and tells which one it was.
+    #[cfg(feature = "quic")]
+    pub(crate) fn bind_quic(
+        addrs: &[SocketAddr],
+        identity: &QuicIdentity,
+    ) -> io::Result<(Listener, SocketAddr)> {
+        let (listener, local) = QuicListener::bind(addrs, identity)?;
+        Ok((Listener::Quic(listener), local))
+    }
+
     /// Waits for connections without blocking, so that it can be stopped.
     pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
         match self {
@@ -243,6 +283,9 @@ impl Listener {
             Listener::Sctp(l) => l.set_nonblocking(true),
             #[cfg(unix)]
             Listener::Unix(l) => l.set_nonblocking(true),
+            // Its accept never blocks.
+            #[cfg(feature = "quic")]
+            Listener::Quic(_) => Ok(()),
         }
     }
 
@@ -268,6 +311,8 @@ impl Listener {
                 stream.set_nonblocking(false)?;
                 Ok(Stream::Unix(stream))
             }
+            #[cfg(feature = "quic")]
+            Listener::Quic(l) => l.accept().map(Stream::Quic),
         }
     }
 }

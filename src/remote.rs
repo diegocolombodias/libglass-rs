@@ -66,7 +66,7 @@ impl<T: Wire> Remote<T> {
         }
 
         let msg = RemoteMsg::Create(name.to_owned());
-        if let Err(e) = core.send_to_server(REMOTE_PLUGIN_ID, msg.encode()) {
+        if let Err(e) = core.register(REMOTE_PLUGIN_ID, name, msg.encode()) {
             core.state.lock().unwrap().remotes.remove(name);
             return Err(e);
         }
@@ -195,6 +195,7 @@ impl<T> Drop for Remote<T> {
         self.core.state.lock().unwrap().remotes.remove(&self.name);
         self.core.changed.notify_all();
         let msg = RemoteMsg::Delete(self.name.clone());
+        self.core.unregister(REMOTE_PLUGIN_ID, &self.name);
         let _ = self.core.send_to_server(REMOTE_PLUGIN_ID, msg.encode());
     }
 }

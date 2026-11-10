@@ -30,6 +30,8 @@ impl Conn {
             Stream::Sctp(s) => sctp_local_addr(s)?.ip(),
             #[cfg(unix)]
             Stream::Unix(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.local_ip(),
         };
         let conn = Conn {
             writer: Mutex::new(stream),

@@ -68,7 +68,7 @@ impl<T: Wire + 'static> Messenger<T> {
             Mode::Local => MessengerMsg::CreateLocal(name.to_owned()),
             Mode::Global => MessengerMsg::CreateGlobal(name.to_owned()),
         };
-        if let Err(e) = core.send_to_server(MESSENGER_PLUGIN_ID, msg.encode()) {
+        if let Err(e) = core.register(MESSENGER_PLUGIN_ID, name, msg.encode()) {
             core.state.lock().unwrap().messengers.remove(name);
             return Err(e);
         }
@@ -160,6 +160,11 @@ impl<T: Wire + 'static> Messenger<T> {
         self.queue_size() == 0
     }
 
+    /// Whether the client has lost its connection.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.core.state.lock().unwrap().closed
+    }
+
     pub fn queue_size(&self) -> usize {
         let state = self.core.state.lock().unwrap();
         let slot = state.messengers.get(&self.name);
@@ -205,6 +210,7 @@ impl<T> Drop for Messenger<T> {
             .remove(&self.name);
         self.core.changed.notify_all();
         let msg = MessengerMsg::Delete(self.name.clone());
+        self.core.unregister(MESSENGER_PLUGIN_ID, &self.name);
         let _ = self.core.send_to_server(MESSENGER_PLUGIN_ID, msg.encode());
     }
 }

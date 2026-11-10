@@ -46,6 +46,12 @@ class WithServer(unittest.TestCase):
             with self.assertRaises(libglass.Timeout):
                 ev_b.get(timeout=0.05)
 
+    def test_event_tells_its_sender(self):
+        with libglass.Event(self.a, "ev") as ev_a, libglass.Event(self.b, "ev") as ev_b:
+            time.sleep(SETTLE)
+            ev_a.enqueue(b"from a")
+            self.assertEqual(ev_b.get_with_sender(), (self.a.id, b"from a"))
+
     def test_shared(self):
         with libglass.Shared(self.a, "x", b"0") as x_a, libglass.Shared(self.b, "x", b"0") as x_b:
             time.sleep(SETTLE)
@@ -100,6 +106,20 @@ class WithServer(unittest.TestCase):
         self.a.kill_all()
         self.server.wait()
         wait_until(lambda: not self.b.is_connected)
+
+
+class Reconnect(unittest.TestCase):
+    def test_client_comes_back_to_a_restarted_server(self):
+        server = libglass.Server()
+        address = server.address
+        with libglass.Client(address, "a") as a:
+            a.set_reconnect(20)
+            old_id = a.id
+            server.close()
+            wait_until(lambda: not a.is_connected)
+            with libglass.Server(address):
+                wait_until(lambda: a.is_connected)
+                self.assertEqual(a.id, old_id)
 
 
 class WithPeers(unittest.TestCase):

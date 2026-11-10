@@ -24,6 +24,8 @@ mod owners;
 pub mod packet;
 mod plugin;
 pub mod protocol;
+#[cfg(feature = "quic")]
+mod quic;
 mod remote;
 mod serial;
 mod server;
@@ -41,6 +43,8 @@ pub use error::{Error, Result};
 pub use event::Event;
 pub use messenger::Messenger;
 pub use plugin::{NodeKind, PacketSource, PluginMessage, ServerPlugin, MAX_RESERVED_PLUGIN_ID};
+#[cfg(feature = "quic")]
+pub use quic::{QuicFingerprint, QuicIdentity, QuicTrust};
 pub use remote::Remote;
 pub use serial::{EventSerializable, ObjectRegistry, Serializable};
 pub use server::{GlassServer, PeerInfo};

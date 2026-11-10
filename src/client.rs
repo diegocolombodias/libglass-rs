@@ -8,11 +8,13 @@ use crate::packet::Packet;
 use crate::protocol::{
     AliasMsg, BarrierKind, BarrierMsg, EventMsg, MessengerMsg, RemoteMsg, RootMsg, SharedMsg,
 };
+#[cfg(feature = "quic")]
+use crate::quic::QuicTrust;
 use crate::remote::RemoteSlot;
 use crate::server::{wake_udp, MAX_DATAGRAM_SIZE};
 use crate::shared::SharedSlot;
 use crate::transport::Stream;
-#[cfg(unix)]
+#[cfg(any(unix, feature = "quic"))]
 use crate::transport::Transport;
 use crate::types::*;
 use std::collections::hash_map::RandomState;
@@ -21,7 +23,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -30,6 +32,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const UDP_SETUP_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_RECONNECT_PAUSE: Duration = Duration::from_secs(2);
+
+/// Opens a new connection to the same server, to replace a lost one.
+type Dial = Box<dyn Fn() -> std::io::Result<Stream> + Send + Sync>;
 
 type PluginHandler = Arc<Mutex<dyn FnMut(NodeId, &[u8]) + Send>>;
 
@@ -55,7 +61,16 @@ pub(crate) struct ClientState {
 /// The part of a client shared with its reading thread and plugin objects.
 pub(crate) struct ClientCore {
     id: AtomicU32,
-    conn: Arc<Conn>,
+    nickname: String,
+    /// Replaced when the client connects again.
+    conn: Mutex<Arc<Conn>>,
+    dial: Dial,
+    reconnect_window: Mutex<Option<Duration>>,
+    /// Set when the client is dropped, so that it does not connect again.
+    leaving: AtomicBool,
+    /// What each object told the server when it was created, by plugin and name, to
+    /// tell it again after a reconnection.
+    registrations: Mutex<BTreeMap<(PluginId, String), Vec<u8>>>,
     udp: Mutex<Option<(Arc<UdpSocket>, SocketAddr)>>,
     pub(crate) state: Mutex<ClientState>,
     pub(crate) changed: Condvar,
@@ -75,7 +90,7 @@ impl ClientCore {
             targets,
             payload,
         };
-        self.conn.send(&packet.encode()?)
+        self.conn().send(&packet.encode()?)
     }
 
     /// Sends through UDP if possible. Otherwise, or if it does not fit in a
@@ -99,11 +114,42 @@ impl ClientCore {
                 return Ok(());
             }
         }
-        self.conn.send(&frame)
+        self.conn().send(&frame)
     }
 
     pub(crate) fn send_to_server(&self, plugin: PluginId, payload: Vec<u8>) -> Result<()> {
         self.send(plugin, payload, BTreeSet::from([SERVERS_ID]))
+    }
+
+    fn conn(&self) -> Arc<Conn> {
+        self.conn.lock().unwrap().clone()
+    }
+
+    /// Creates an object in the server, and keeps the message to create it again
+    /// after a reconnection.
+    pub(crate) fn register(&self, plugin: PluginId, name: &str, message: Vec<u8>) -> Result<()> {
+        let key = (plugin, name.to_owned());
+        let mut registrations = self.registrations.lock().unwrap();
+        registrations.insert(key.clone(), message.clone());
+        drop(registrations);
+        let result = self.send_to_server(plugin, message);
+        if result.is_err() {
+            self.registrations.lock().unwrap().remove(&key);
+        }
+        result
+    }
+
+    /// Changes how an object is created again after a reconnection.
+    pub(crate) fn update_registration(&self, plugin: PluginId, name: &str, message: Vec<u8>) {
+        let mut registrations = self.registrations.lock().unwrap();
+        if let Some(kept) = registrations.get_mut(&(plugin, name.to_owned())) {
+            *kept = message;
+        }
+    }
+
+    pub(crate) fn unregister(&self, plugin: PluginId, name: &str) {
+        let key = (plugin, name.to_owned());
+        self.registrations.lock().unwrap().remove(&key);
     }
 
     pub(crate) fn id(&self) -> NodeId {
@@ -129,7 +175,9 @@ pub struct GlassClient {
 impl GlassClient {
     /// Connects to a server. Returns only after the handshake has finished.
     pub fn connect<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
-        GlassClient::from_stream(Stream::Tcp(TcpStream::connect(server)?), nickname)
+        let addrs: Vec<SocketAddr> = server.to_socket_addrs()?.collect();
+        let stream = Stream::Tcp(TcpStream::connect(&addrs[..])?);
+        GlassClient::from_stream(stream, nickname, tcp_dial(addrs))
     }
 
     /// Keeps trying to connect until it works or the time runs out, for when the
@@ -152,15 +200,29 @@ impl GlassClient {
         retry(timeout, || GlassClient::connect_sctp(&server, nickname))
     }
 
+    /// Like [`connect_retry`](Self::connect_retry), through QUIC.
+    #[cfg(feature = "quic")]
+    pub fn connect_retry_quic<A: ToSocketAddrs>(
+        server: A,
+        nickname: &str,
+        trust: QuicTrust,
+        timeout: Duration,
+    ) -> Result<GlassClient> {
+        retry(timeout, || {
+            GlassClient::connect_quic(&server, nickname, trust)
+        })
+    }
+
     /// Connects to a server, and asks to use UDP for
     /// [`Event::enqueue_unreliable`](crate::Event::enqueue_unreliable). If that
     /// does not work, for example because of a firewall, the client still works
     /// and everything goes through TCP: see [`uses_udp`](Self::uses_udp).
     pub fn connect_with_udp<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
-        let stream = TcpStream::connect(server)?;
+        let addrs: Vec<SocketAddr> = server.to_socket_addrs()?.collect();
+        let stream = TcpStream::connect(&addrs[..])?;
         let server_ip = stream.peer_addr()?.ip();
         let local_ip = stream.local_addr()?.ip();
-        let mut client = GlassClient::from_stream(Stream::Tcp(stream), nickname)?;
+        let mut client = GlassClient::from_stream(Stream::Tcp(stream), nickname, tcp_dial(addrs))?;
         if let Err(e) = client.enable_udp(local_ip, server_ip) {
             log::warn!("could not set up UDP: {e}");
         }
@@ -172,21 +234,51 @@ impl GlassClient {
     /// peers. Returns an error if the kernel does not have SCTP.
     #[cfg(unix)]
     pub fn connect_sctp<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
-        GlassClient::from_stream(Transport::Sctp.connect(server)?, nickname)
+        let addrs: Vec<SocketAddr> = server.to_socket_addrs()?.collect();
+        let stream = Transport::Sctp.connect(&addrs[..])?;
+        let dial = Box::new(move || Transport::Sctp.connect(&addrs[..]));
+        GlassClient::from_stream(stream, nickname, dial)
+    }
+
+    /// Connects through QUIC to a server started with
+    /// [`GlassServer::bind_quic`](crate::GlassServer::bind_quic) or its variants for
+    /// peers. `trust` tells which certificate the server must present; with
+    /// [`QuicTrust::AnyCertificate`], nothing protects against a man in the middle.
+    ///
+    /// The library runs QUIC on a tokio runtime of its own, so this client, and a
+    /// QUIC server, must not be used from inside a tokio runtime: that panics.
+    #[cfg(feature = "quic")]
+    pub fn connect_quic<A: ToSocketAddrs>(
+        server: A,
+        nickname: &str,
+        trust: QuicTrust,
+    ) -> Result<GlassClient> {
+        let addrs: Vec<SocketAddr> = server.to_socket_addrs()?.collect();
+        let stream = Transport::Quic(trust).connect(&addrs[..])?;
+        let dial = Box::new(move || Transport::Quic(trust).connect(&addrs[..]));
+        GlassClient::from_stream(stream, nickname, dial)
     }
 
     /// Connects to a server on a Unix socket.
     #[cfg(unix)]
     pub fn connect_unix<P: AsRef<Path>>(path: P, nickname: &str) -> Result<GlassClient> {
-        let stream = std::os::unix::net::UnixStream::connect(path)?;
-        GlassClient::from_stream(Stream::Unix(stream), nickname)
+        use std::os::unix::net::UnixStream;
+        let path = path.as_ref().to_owned();
+        let stream = Stream::Unix(UnixStream::connect(&path)?);
+        let dial = Box::new(move || UnixStream::connect(&path).map(Stream::Unix));
+        GlassClient::from_stream(stream, nickname, dial)
     }
 
-    fn from_stream(stream: Stream, nickname: &str) -> Result<GlassClient> {
+    fn from_stream(stream: Stream, nickname: &str, dial: Dial) -> Result<GlassClient> {
         let (conn, mut reader) = Conn::new(stream)?;
         let core = Arc::new(ClientCore {
             id: AtomicU32::new(NOBODY_ID),
-            conn,
+            nickname: nickname.to_owned(),
+            conn: Mutex::new(conn),
+            dial,
+            reconnect_window: Mutex::new(None),
+            leaving: AtomicBool::new(false),
+            registrations: Mutex::new(BTreeMap::new()),
             udp: Mutex::new(None),
             state: Mutex::new(ClientState::default()),
             changed: Condvar::new(),
@@ -199,7 +291,7 @@ impl GlassClient {
         )?;
 
         reader.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        handshake(&core, &mut reader).inspect_err(|_| core.conn.close())?;
+        handshake(&core, &mut reader).inspect_err(|_| core.conn().close())?;
         reader.set_read_timeout(None)?;
 
         let reader = {
@@ -270,6 +362,17 @@ impl GlassClient {
         let core = self.core.clone();
         self.udp_reader = Some(thread::spawn(move || udp_loop(core, socket, server)));
         Ok(())
+    }
+
+    /// Makes the client connect again when it loses the server, trying for up to
+    /// `window` each time; `None`, the default, turns it off. While it is away,
+    /// [`is_connected`](Self::is_connected) is false and waits fail with
+    /// [`Error::Disconnected`]. Then it gets back its id, if the server still has it
+    /// free, and its objects are created there again. Packets sent while it was away
+    /// are lost, and so are the values held only by the server, such as aliases.
+    /// UDP is not set up again.
+    pub fn set_reconnect(&self, window: Option<Duration>) {
+        *self.core.reconnect_window.lock().unwrap() = window;
     }
 
     /// Is this client using UDP for unreliable packets?
@@ -362,10 +465,11 @@ impl GlassClient {
 
 impl Drop for GlassClient {
     fn drop(&mut self) {
+        self.core.leaving.store(true, Ordering::SeqCst);
         let _ = self
             .core
             .send_to_server(ROOT_PLUGIN_ID, RootMsg::Bye.encode());
-        self.core.conn.close();
+        self.core.conn().close();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -445,19 +549,91 @@ fn udp_loop(core: Arc<ClientCore>, socket: Arc<UdpSocket>, server: SocketAddr) {
 fn read_loop(core: Arc<ClientCore>, mut reader: Stream) {
     let _close = CloseOnExit(core.clone());
     loop {
-        match Packet::read_from(&mut reader) {
+        if !read_until_closed(&core, &mut reader) || core.leaving.load(Ordering::SeqCst) {
+            return;
+        }
+        match reconnect(&core) {
+            Some(new_reader) => reader = new_reader,
+            None => return,
+        }
+    }
+}
+
+/// Handles packets until the connection closes. Returns false if the server told the
+/// client to stop.
+fn read_until_closed(core: &ClientCore, reader: &mut Stream) -> bool {
+    loop {
+        match Packet::read_from(reader) {
             Ok(Some(packet)) => {
-                if !on_packet(&core, &packet) {
-                    return;
+                if !on_packet(core, &packet) {
+                    return false;
                 }
             }
-            Ok(None) => return,
+            Ok(None) => return true,
             Err(e) => {
                 log::debug!("connection closed: {e}");
-                return;
+                return true;
             }
         }
     }
+}
+
+/// Connects again, if the client was asked to. Gives the reading half of the new
+/// connection, or `None` if it gave up.
+fn reconnect(core: &ClientCore) -> Option<Stream> {
+    let window = (*core.reconnect_window.lock().unwrap())?;
+    // Meanwhile, waits fail instead of waiting for what will not come.
+    core.mark_closed();
+    // UDP is not set up again: its reading thread ends, and events go by the connection.
+    if let Some((socket, _)) = core.udp.lock().unwrap().take() {
+        wake_udp(&socket);
+    }
+
+    let old_id = core.id();
+    let deadline = Instant::now() + window;
+    let mut pause = CONNECT_RETRY_INTERVAL;
+    while Instant::now() < deadline && !core.leaving.load(Ordering::SeqCst) {
+        match connect_again(core, old_id) {
+            Ok(reader) => {
+                log::info!("connected again, as {:#x}", core.id());
+                return Some(reader);
+            }
+            Err(e) => log::debug!("could not connect again yet: {e}"),
+        }
+        thread::sleep(pause);
+        pause = (pause * 2).min(MAX_RECONNECT_PAUSE);
+    }
+    log::warn!("gave up connecting again");
+    None
+}
+
+fn connect_again(core: &ClientCore, old_id: NodeId) -> Result<Stream> {
+    let (conn, mut reader) = Conn::new((core.dial)()?)?;
+    *core.conn.lock().unwrap() = conn.clone();
+    // Dropping the client closes the connection it sees, which may be the old one.
+    if core.leaving.load(Ordering::SeqCst) {
+        conn.close();
+        return Err(Error::Disconnected);
+    }
+    let hello = RootMsg::HelloAgain(core.nickname.clone(), old_id);
+    core.send(ROOT_PLUGIN_ID, hello.encode(), BTreeSet::new())?;
+    reader.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    handshake(core, &mut reader).inspect_err(|_| conn.close())?;
+    reader.set_read_timeout(None)?;
+
+    let registrations: Vec<(PluginId, Vec<u8>)> = core
+        .registrations
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|((plugin, _), message)| (*plugin, message.clone()))
+        .collect();
+    for (plugin, message) in registrations {
+        core.send_to_server(plugin, message)?;
+    }
+    core.state.lock().unwrap().closed = false;
+    core.changed.notify_all();
+    Ok(reader)
 }
 
 /// Handles a packet from the server. Returns false if the client should stop.
@@ -465,7 +641,7 @@ fn on_packet(core: &ClientCore, packet: &Packet) -> bool {
     match packet.plugin {
         ROOT_PLUGIN_ID => return on_root(core, packet),
         EVENT_PLUGIN_ID => match EventMsg::decode(&packet.payload) {
-            Ok(EventMsg::Event(name, data)) => event::deliver(core, &name, data),
+            Ok(EventMsg::Event(name, data)) => event::deliver(core, &name, packet.from, data),
             Ok(other) => log::warn!("unexpected event message: {other:?}"),
             Err(e) => log::warn!("invalid event message: {e}"),
         },
@@ -592,6 +768,10 @@ fn on_root(core: &ClientCore, packet: &Packet) -> bool {
             true
         }
     }
+}
+
+fn tcp_dial(addrs: Vec<SocketAddr>) -> Dial {
+    Box::new(move || TcpStream::connect(&addrs[..]).map(Stream::Tcp))
 }
 
 fn retry(

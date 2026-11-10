@@ -15,6 +15,10 @@ const LINK_START: u8 = 1;
 const LINK_LIST: u8 = 2;
 const LINK_LIST_UPDATE: u8 = 3;
 const LINK_CHANGE_ID: u8 = 4;
+const LINK_ACCEPTED: u8 = 5;
+const LINK_ID_TAKEN: u8 = 6;
+/// The highest message code of links.
+const LINK_LAST: u8 = REMOTE_PEER_BASE + LINK_ID_TAKEN;
 
 const RELATION_PEER: u32 = 3;
 const RELATION_REMOTE_PEER: u32 = 4;
@@ -48,25 +52,49 @@ fn link_relation(kind: LinkKind) -> u32 {
     }
 }
 
-fn encode_link_addr(kind: LinkKind, offset: u8, addr: &PeerAddr) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9 + addr.host.len());
+/// The address of a server, and the number it drew when it started, after a NUL. Without
+/// a number, which is 0, it is the format of the C++ library.
+fn encode_link_addr(kind: LinkKind, offset: u8, addr: &PeerAddr, nonce: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18 + addr.host.len());
     out.push(link_base(kind) + offset);
     out.extend_from_slice(&link_relation(kind).to_be_bytes());
     out.extend_from_slice(&u32::from(addr.port).to_be_bytes());
-    out.extend_from_slice(addr.host.as_bytes());
+    out.extend_from_slice(truncated(&addr.host).as_bytes());
+    if nonce != 0 {
+        out.push(0);
+        out.extend_from_slice(&nonce.to_be_bytes());
+    }
     out
 }
 
-fn decode_link_addr(bytes: &[u8]) -> Result<PeerAddr> {
+fn decode_link_addr(bytes: &[u8]) -> Result<(PeerAddr, u64)> {
     let port = read_port(bytes, 5)?;
     let host = bytes
         .get(9..)
         .ok_or(Error::InvalidPacket("truncated peer address"))?;
     let end = host.iter().position(|&b| b == 0).unwrap_or(host.len());
-    Ok(PeerAddr {
+    let nonce = match host.get(end + 1..) {
+        Some(rest) if rest.len() == 8 => u64::from_be_bytes(rest.try_into().unwrap()),
+        _ => 0,
+    };
+    let addr = PeerAddr {
         host: String::from_utf8_lossy(&host[..end]).into_owned(),
         port,
-    })
+    };
+    Ok((addr, nonce))
+}
+
+fn encode_link_nonce(kind: LinkKind, offset: u8, nonce: u64) -> Vec<u8> {
+    let mut out = vec![link_base(kind) + offset];
+    out.extend_from_slice(&nonce.to_be_bytes());
+    out
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    bytes
+        .get(offset..offset + 8)
+        .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+        .ok_or(Error::InvalidPacket("truncated integer"))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -89,16 +117,26 @@ pub enum RootMsg {
     SetMaster,
     /// Client to server: first packet of a connection.
     Hello(String),
+    /// Client to server: first packet of a connection that replaces a lost one. The
+    /// client gets the id it had, if it is still free in this server.
+    HelloAgain(String, NodeId),
     QuitAll,
     Bye,
-    /// New server to a server of the group: I am joining, who is there?
-    PeerStart(LinkKind, PeerAddr),
+    /// New server to a server of the group: I am joining, who is there? The number is
+    /// drawn by each server when it starts, to tell apart two servers with the same id.
+    PeerStart(LinkKind, PeerAddr, u64),
     /// Answer to `PeerStart`: the servers of the group, including the sender.
     PeerList(LinkKind, BTreeMap<NodeId, PeerAddr>),
     /// New server to the other servers it found in the list.
-    PeerListUpdate(LinkKind, PeerAddr),
+    PeerListUpdate(LinkKind, PeerAddr, u64),
     /// Answer to `PeerStart`: your id is taken, use this one.
     PeerChangeId(LinkKind, NodeId),
+    /// Answer to `PeerStart` and `PeerListUpdate`: the link is made. It carries the
+    /// number of the server that answers.
+    PeerAccepted(LinkKind, u64),
+    /// Answer to `PeerListUpdate`: another server already has your id, so start over
+    /// with another one. The connection is closed after it.
+    PeerIdTaken(LinkKind),
     /// Client to server, through both the connection and UDP, to link the two.
     UdpRegister(u64),
     /// Server to client: the port to send datagrams to, or 0 if it has no UDP.
@@ -149,8 +187,20 @@ impl RootMsg {
                 out
             }
             RootMsg::UdpReady => vec![8],
-            RootMsg::PeerStart(kind, addr) => encode_link_addr(*kind, LINK_START, addr),
-            RootMsg::PeerListUpdate(kind, addr) => encode_link_addr(*kind, LINK_LIST_UPDATE, addr),
+            RootMsg::HelloAgain(nickname, id) => {
+                let mut out = vec![9];
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(nickname.as_bytes());
+                out
+            }
+            RootMsg::PeerStart(kind, addr, nonce) => {
+                encode_link_addr(*kind, LINK_START, addr, *nonce)
+            }
+            RootMsg::PeerListUpdate(kind, addr, nonce) => {
+                encode_link_addr(*kind, LINK_LIST_UPDATE, addr, *nonce)
+            }
+            RootMsg::PeerAccepted(kind, nonce) => encode_link_nonce(*kind, LINK_ACCEPTED, *nonce),
+            RootMsg::PeerIdTaken(kind) => vec![link_base(*kind) + LINK_ID_TAKEN],
             RootMsg::PeerList(kind, peers) => {
                 let mut out =
                     Vec::with_capacity(PEER_LIST_HEADER_LEN + peers.len() * PEER_ENTRY_LEN);
@@ -218,7 +268,11 @@ impl RootMsg {
                 )))
             }
             8 => Ok(RootMsg::UdpReady),
-            PEER_BASE..=115 => decode_link_message(bytes, kind),
+            9 => Ok(RootMsg::HelloAgain(
+                String::from_utf8_lossy(bytes.get(5..).unwrap_or_default()).into_owned(),
+                read_u32(bytes, 1)?,
+            )),
+            PEER_BASE..=LINK_LAST => decode_link_message(bytes, kind),
             _ => Err(Error::InvalidPacket("unknown root message")),
         }
     }
@@ -231,10 +285,16 @@ fn decode_link_message(bytes: &[u8], code: u8) -> Result<RootMsg> {
         (LinkKind::Peer, code - PEER_BASE)
     };
     match offset {
-        LINK_START => Ok(RootMsg::PeerStart(link, decode_link_addr(bytes)?)),
-        LINK_HELLO | LINK_LIST_UPDATE => {
-            Ok(RootMsg::PeerListUpdate(link, decode_link_addr(bytes)?))
+        LINK_START => {
+            let (addr, nonce) = decode_link_addr(bytes)?;
+            Ok(RootMsg::PeerStart(link, addr, nonce))
         }
+        LINK_HELLO | LINK_LIST_UPDATE => {
+            let (addr, nonce) = decode_link_addr(bytes)?;
+            Ok(RootMsg::PeerListUpdate(link, addr, nonce))
+        }
+        LINK_ACCEPTED => Ok(RootMsg::PeerAccepted(link, read_u64(bytes, 1)?)),
+        LINK_ID_TAKEN => Ok(RootMsg::PeerIdTaken(link)),
         LINK_LIST => {
             let count = read_u32(bytes, 5)? as usize;
             let entries = &bytes[PEER_LIST_HEADER_LEN..];
@@ -594,14 +654,14 @@ mod tests {
             host: "ab".into(),
             port: 7001,
         };
-        let start = RootMsg::PeerStart(LinkKind::Peer, addr.clone());
+        let start = RootMsg::PeerStart(LinkKind::Peer, addr.clone(), 0);
         assert_eq!(
             start.encode(),
             [101, 0, 0, 0, 3, 0, 0, 0x1B, 0x59, b'a', b'b']
         );
         assert_eq!(RootMsg::decode(&start.encode()).unwrap(), start);
 
-        let update = RootMsg::PeerListUpdate(LinkKind::Remote, addr);
+        let update = RootMsg::PeerListUpdate(LinkKind::Remote, addr, 0);
         assert_eq!(
             update.encode(),
             [113, 0, 0, 0, 4, 0, 0, 0x1B, 0x59, b'a', b'b']
@@ -611,6 +671,38 @@ mod tests {
         let change = RootMsg::PeerChangeId(LinkKind::Peer, 0x20000);
         assert_eq!(change.encode(), [104, 0, 2, 0, 0]);
         assert_eq!(RootMsg::decode(&change.encode()).unwrap(), change);
+    }
+
+    #[test]
+    fn hello_again_carries_the_old_id() {
+        let hello = RootMsg::HelloAgain("ana".into(), 0x10003);
+        assert_eq!(hello.encode(), [9, 0, 1, 0, 3, b'a', b'n', b'a']);
+        assert_eq!(RootMsg::decode(&hello.encode()).unwrap(), hello);
+        assert!(RootMsg::decode(&[9, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn link_messages_carry_the_number_of_the_server() {
+        let addr = PeerAddr {
+            host: "ab".into(),
+            port: 7001,
+        };
+        let start = RootMsg::PeerStart(LinkKind::Peer, addr.clone(), 0x0102_0304_0506_0708);
+        let bytes = start.encode();
+        assert_eq!(bytes[9..], [b'a', b'b', 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(RootMsg::decode(&bytes).unwrap(), start);
+
+        let update = RootMsg::PeerListUpdate(LinkKind::Remote, addr, 9);
+        assert_eq!(RootMsg::decode(&update.encode()).unwrap(), update);
+
+        for message in [
+            RootMsg::PeerAccepted(LinkKind::Remote, 9),
+            RootMsg::PeerIdTaken(LinkKind::Peer),
+            RootMsg::PeerIdTaken(LinkKind::Remote),
+        ] {
+            assert_eq!(RootMsg::decode(&message.encode()).unwrap(), message);
+        }
+        assert!(RootMsg::decode(&[105, 0, 0]).is_err(), "a truncated number");
     }
 
     #[test]

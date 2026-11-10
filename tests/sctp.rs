@@ -124,11 +124,14 @@ fn stream_transfers_a_file_over_sctp() {
     thread::sleep(SETTLE);
 
     let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 253) as u8).collect();
-    let sent = stream_a.send_from(b.id(), &mut data.as_slice()).unwrap();
-    assert_eq!(sent, data.len() as u64);
-
+    // The sender waits for the receiver, so they must run at the same time.
     let mut received = Vec::new();
-    let (from, size) = stream_b.receive(&mut received, LARGE_TIMEOUT).unwrap();
+    let (sent, (from, size)) = thread::scope(|scope| {
+        let sender = scope.spawn(|| stream_a.send_from(b.id(), &mut data.as_slice()).unwrap());
+        let got = stream_b.receive(&mut received, LARGE_TIMEOUT).unwrap();
+        (sender.join().unwrap(), got)
+    });
+    assert_eq!(sent, data.len() as u64);
     assert_eq!((from, size), (a.id(), sent));
     assert!(received == data);
 }

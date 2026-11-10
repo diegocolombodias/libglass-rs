@@ -54,6 +54,9 @@ void glass_server_free(GlassServer *server);
 
 GlassClient *glass_client_connect(const char *addr, const char *nickname);
 GlassClient *glass_client_connect_sctp(const char *addr, const char *nickname);
+/* Connect again when the server is lost, trying for up to window_ms each time; 0, the
+ * default, turns it off. See GlassClient::set_reconnect for what is kept. */
+void glass_client_set_reconnect(const GlassClient *client, uint64_t window_ms);
 uint32_t glass_client_id(const GlassClient *client);
 int glass_client_is_master(const GlassClient *client);
 int glass_client_is_connected(const GlassClient *client);
@@ -68,6 +71,9 @@ int glass_event_enqueue(const GlassEvent *event, const uint8_t *data, size_t len
                         uint32_t target, int send_to_self);
 int glass_event_get(const GlassEvent *event, uint64_t timeout_ms, uint8_t **out,
                     size_t *out_len);
+/* The same, and the id of the client that sent the event. */
+int glass_event_get_with_sender(const GlassEvent *event, uint64_t timeout_ms, uint32_t *from,
+                                uint8_t **out, size_t *out_len);
 size_t glass_event_queue_size(const GlassEvent *event);
 void glass_event_free(GlassEvent *event);
 

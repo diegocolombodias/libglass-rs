@@ -23,6 +23,8 @@ pub struct Barrier {
     core: Arc<ClientCore>,
     number: u32,
     group: u32,
+    /// How it was created, to create it again after a reconnection.
+    create: BarrierKind,
 }
 
 impl Barrier {
@@ -54,9 +56,27 @@ impl Barrier {
             core,
             number,
             group,
+            create: kind,
         };
-        barrier.send(kind, active)?;
+        barrier.register(active)?;
         Ok(barrier)
+    }
+
+    fn key(&self) -> String {
+        format!("{}:{}", self.group, self.number)
+    }
+
+    /// Creates the barrier in the server, and keeps how, to create it again after a
+    /// reconnection.
+    fn register(&self, active: bool) -> Result<()> {
+        let msg = BarrierMsg {
+            kind: self.create,
+            number: self.number,
+            group: self.group,
+            active,
+        };
+        self.core
+            .register(BARRIER_PLUGIN_ID, &self.key(), msg.encode())
     }
 
     fn send(&self, kind: BarrierKind, active: bool) -> Result<()> {
@@ -72,12 +92,28 @@ impl Barrier {
     /// Stops this client from taking part in the barrier: the others no longer
     /// wait for it, and its own calls to sync return right away.
     pub fn disable(&self) -> Result<()> {
-        self.send(BarrierKind::Disable, false)
+        self.send(BarrierKind::Disable, false)?;
+        self.core
+            .update_registration(BARRIER_PLUGIN_ID, &self.key(), self.create_message(false));
+        Ok(())
     }
 
     /// Makes this client take part in the barrier again.
     pub fn enable(&self) -> Result<()> {
-        self.send(BarrierKind::Enable, false)
+        self.send(BarrierKind::Enable, false)?;
+        self.core
+            .update_registration(BARRIER_PLUGIN_ID, &self.key(), self.create_message(true));
+        Ok(())
+    }
+
+    fn create_message(&self, active: bool) -> Vec<u8> {
+        BarrierMsg {
+            kind: self.create,
+            number: self.number,
+            group: self.group,
+            active,
+        }
+        .encode()
     }
 
     /// Blocks until all the clients with this barrier have called sync.
@@ -117,6 +153,7 @@ impl Drop for Barrier {
         let key = (self.group, self.number);
         self.core.state.lock().unwrap().barriers.remove(&key);
         self.core.changed.notify_all();
+        self.core.unregister(BARRIER_PLUGIN_ID, &self.key());
         let _ = self.send(BarrierKind::Delete, false);
     }
 }

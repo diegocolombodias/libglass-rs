@@ -1,21 +1,26 @@
-//! Compares TCP, UDP and SCTP with payloads of different sizes, through the library:
-//! two clients exchange an `Event`, and each message goes from a client to the server
-//! and from there to the other client.
+//! Compares TCP, UDP, SCTP and, with the feature `quic`, QUIC with payloads of different
+//! sizes, through the library: two clients exchange an `Event`, and each message goes
+//! from a client to the server and from there to the other client.
 //!
 //! It measures the round trip of a message and the rate of a burst. It also checks every
-//! message, and fails if TCP or SCTP lose, change or reorder any.
+//! message, and fails if TCP, SCTP or QUIC lose, change or reorder any.
 //!
 //! ```text
-//! cargo run --release --example compare_transports -- [--repeats N] [--quick] [--only tcp|udp|sctp]
+//! cargo run --release --features quic --example compare_transports -- [--repeats N] [--quick] [--only tcp|udp|sctp|quic]
 //!
-//! machine1$ cargo run --release --example compare_transports -- serve
-//! machine2$ cargo run --release --example compare_transports -- --remote machine1
+//! machine1$ cargo run --release --features quic --example compare_transports -- serve
+//! machine2$ cargo run --release --features quic --example compare_transports -- --remote machine1 --fingerprint F
 //! ```
+//!
+//! `serve` shows the fingerprint `F` of its QUIC certificate. Without `--fingerprint`, the
+//! clients accept any certificate.
 //!
 //! Payloads that do not fit in a datagram are not measured for UDP, as the library would
 //! send them through TCP. Without `--remote`, everything runs in one process, so the
 //! clients and the server share the CPU, and there is no real network to lose packets.
 
+#[cfg(feature = "quic")]
+use libglass::QuicTrust;
 use libglass::{Bytes, Error as GlassError, Event, GlassClient, GlassServer, Mode, NodeId};
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -93,6 +98,8 @@ enum Protocol {
     Udp,
     #[cfg(unix)]
     Sctp,
+    #[cfg(feature = "quic")]
+    Quic,
 }
 
 impl Protocol {
@@ -102,6 +109,8 @@ impl Protocol {
             Protocol::Udp,
             #[cfg(unix)]
             Protocol::Sctp,
+            #[cfg(feature = "quic")]
+            Protocol::Quic,
         ]
     }
 
@@ -111,6 +120,8 @@ impl Protocol {
             Protocol::Udp => "UDP",
             #[cfg(unix)]
             Protocol::Sctp => "SCTP",
+            #[cfg(feature = "quic")]
+            Protocol::Quic => "QUIC",
         }
     }
 
@@ -120,6 +131,8 @@ impl Protocol {
             Protocol::Udp => BASE_PORT + 1,
             #[cfg(unix)]
             Protocol::Sctp => BASE_PORT + 2,
+            #[cfg(feature = "quic")]
+            Protocol::Quic => BASE_PORT + 3,
         }
     }
 
@@ -133,9 +146,11 @@ impl Protocol {
 
     /// Only SCTP may be missing from a system, and only if nobody requires it.
     fn may_be_skipped(self) -> bool {
-        self != Protocol::Tcp
-            && self != Protocol::Udp
-            && std::env::var_os("LIBGLASS_REQUIRE_SCTP").is_none()
+        #[cfg(unix)]
+        if self == Protocol::Sctp {
+            return std::env::var_os("LIBGLASS_REQUIRE_SCTP").is_none();
+        }
+        false
     }
 
     fn bind(self, addr: &str) -> Result<GlassServer> {
@@ -144,10 +159,14 @@ impl Protocol {
             Protocol::Udp => GlassServer::bind_with_udp(addr)?,
             #[cfg(unix)]
             Protocol::Sctp => GlassServer::bind_sctp(addr)?,
+            #[cfg(feature = "quic")]
+            Protocol::Quic => GlassServer::bind_quic(addr)?,
         })
     }
 
-    fn connect(self, addr: &str, nickname: &str) -> Result<GlassClient> {
+    /// `fingerprint` is that of the certificate of a QUIC server.
+    #[cfg_attr(not(feature = "quic"), allow(unused_variables))]
+    fn connect(self, addr: &str, nickname: &str, fingerprint: Option<&str>) -> Result<GlassClient> {
         Ok(match self {
             Protocol::Tcp => GlassClient::connect(addr, nickname)?,
             Protocol::Udp => {
@@ -160,6 +179,14 @@ impl Protocol {
             }
             #[cfg(unix)]
             Protocol::Sctp => GlassClient::connect_sctp(addr, nickname)?,
+            #[cfg(feature = "quic")]
+            Protocol::Quic => {
+                let trust = match fingerprint {
+                    Some(fingerprint) => QuicTrust::Fingerprint(fingerprint.parse()?),
+                    None => QuicTrust::AnyCertificate,
+                };
+                GlassClient::connect_quic(addr, nickname, trust)?
+            }
         })
     }
 
@@ -179,18 +206,23 @@ struct Pair {
 }
 
 impl Pair {
-    fn new(protocol: Protocol, remote: Option<&str>) -> Result<Pair> {
-        let (server, addr) = match remote {
-            Some(host) => (None, format!("{host}:{}", protocol.port())),
+    fn new(protocol: Protocol, remote: Option<&str>, fingerprint: Option<&str>) -> Result<Pair> {
+        let (server, addr, fingerprint) = match remote {
+            Some(host) => (
+                None,
+                format!("{host}:{}", protocol.port()),
+                fingerprint.map(str::to_owned),
+            ),
             None => {
                 let server = protocol.bind("127.0.0.1:0")?;
                 let addr = server.local_addr().to_string();
-                (Some(server), addr)
+                let fingerprint = quic_fingerprint(&server);
+                (Some(server), addr, fingerprint)
             }
         };
         Ok(Pair {
-            a: protocol.connect(&addr, "a")?,
-            b: protocol.connect(&addr, "b")?,
+            a: protocol.connect(&addr, "a", fingerprint.as_deref())?,
+            b: protocol.connect(&addr, "b", fingerprint.as_deref())?,
             _server: server,
         })
     }
@@ -205,6 +237,16 @@ impl Pair {
             Event::new(&self.b, &name, Mode::Local)?,
         ))
     }
+}
+
+#[cfg(feature = "quic")]
+fn quic_fingerprint(server: &GlassServer) -> Option<String> {
+    server.quic_fingerprint().map(|f| f.to_string())
+}
+
+#[cfg(not(feature = "quic"))]
+fn quic_fingerprint(_server: &GlassServer) -> Option<String> {
+    None
 }
 
 fn template(size: usize) -> Bytes {
@@ -426,7 +468,11 @@ fn serve() -> Result<()> {
     for protocol in Protocol::all() {
         match protocol.bind(&format!("0.0.0.0:{}", protocol.port())) {
             Ok(server) => {
-                println!("{} on port {}", protocol.name(), protocol.port());
+                print!("{} on port {}", protocol.name(), protocol.port());
+                match quic_fingerprint(&server) {
+                    Some(fingerprint) => println!(", certificate {fingerprint}"),
+                    None => println!(),
+                }
                 servers.push(server);
             }
             Err(e) if protocol.may_be_skipped() => {
@@ -439,14 +485,20 @@ fn serve() -> Result<()> {
     Ok(())
 }
 
-fn run(repeats: usize, quick: bool, remote: Option<&str>, only: Option<&str>) -> Result<()> {
+fn run(
+    repeats: usize,
+    quick: bool,
+    remote: Option<&str>,
+    fingerprint: Option<&str>,
+    only: Option<&str>,
+) -> Result<()> {
     let divisor = if quick { 10 } else { 1 };
     let mut protocols = Vec::new();
     let chosen = Protocol::all()
         .into_iter()
         .filter(|p| only.is_none_or(|name| p.name().eq_ignore_ascii_case(name)));
     for protocol in chosen {
-        match Pair::new(protocol, remote) {
+        match Pair::new(protocol, remote, fingerprint) {
             Ok(_) => protocols.push(protocol),
             Err(e) if protocol.may_be_skipped() => {
                 println!("{} skipped: {e}", protocol.name());
@@ -489,7 +541,7 @@ fn run(repeats: usize, quick: bool, remote: Option<&str>, only: Option<&str>) ->
             for _ in 0..repeats {
                 let samples = (load.samples / divisor).max(2);
                 let messages = (load.messages / divisor).max(2);
-                let pair = Pair::new(protocol, remote)?;
+                let pair = Pair::new(protocol, remote, fingerprint)?;
                 measure_round_trips(protocol, &pair, samples, load.size, &mut measures)?;
                 measure_burst(protocol, &pair, messages, load.size, &mut measures)?;
             }
@@ -500,11 +552,12 @@ fn run(repeats: usize, quick: bool, remote: Option<&str>, only: Option<&str>) ->
 }
 
 fn main() -> Result<()> {
-    const USAGE: &str = "usage: compare_transports [--repeats N] [--quick] [--remote HOST] [--only PROTOCOL] | serve";
+    const USAGE: &str = "usage: compare_transports [--repeats N] [--quick] [--remote HOST [--fingerprint F]] [--only PROTOCOL] | serve";
     let mut args = std::env::args().skip(1);
     let mut repeats = None;
     let mut quick = false;
     let mut remote = None;
+    let mut fingerprint = None;
     let mut only = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -512,6 +565,7 @@ fn main() -> Result<()> {
             "--quick" => quick = true,
             "--repeats" => repeats = Some(args.next().ok_or(USAGE)?.parse()?),
             "--remote" => remote = Some(args.next().ok_or(USAGE)?),
+            "--fingerprint" => fingerprint = Some(args.next().ok_or(USAGE)?),
             "--only" => only = Some(args.next().ok_or(USAGE)?),
             _ => return Err(USAGE.into()),
         }
@@ -520,5 +574,11 @@ fn main() -> Result<()> {
     if repeats == 0 {
         return Err(USAGE.into());
     }
-    run(repeats, quick, remote.as_deref(), only.as_deref())
+    run(
+        repeats,
+        quick,
+        remote.as_deref(),
+        fingerprint.as_deref(),
+        only.as_deref(),
+    )
 }

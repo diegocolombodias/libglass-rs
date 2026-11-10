@@ -273,6 +273,15 @@ pub unsafe extern "C" fn glass_client_connect_sctp(
 }
 
 /// # Safety
+/// `client` must come from this library, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_set_reconnect(client: *const GlassClient, window_ms: u64) {
+    if let Some(client) = client.as_ref() {
+        client.set_reconnect((window_ms > 0).then(|| millis(window_ms)));
+    }
+}
+
+/// # Safety
 /// `client` must come from this library. Gives 0 if it is null.
 #[no_mangle]
 pub unsafe extern "C" fn glass_client_id(client: *const GlassClient) -> NodeId {
@@ -362,6 +371,28 @@ pub unsafe extern "C" fn glass_event_get(
     guard_status(|| {
         let Bytes(data) = object(event)?.get_timeout(millis(timeout_ms))?;
         give_bytes(data, out, out_len)?;
+        Ok(GLASS_OK)
+    })
+}
+
+/// # Safety
+/// `event` must come from this library. The output pointers must be valid, and the
+/// data must be given back with `glass_free_bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_event_get_with_sender(
+    event: *const Event<Bytes>,
+    timeout_ms: u64,
+    from: *mut NodeId,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    guard_status(|| {
+        if from.is_null() {
+            return Err(Error::InvalidPacket("null pointer"));
+        }
+        let (sender, Bytes(data)) = object(event)?.get_with_sender_timeout(millis(timeout_ms))?;
+        give_bytes(data, out, out_len)?;
+        *from = sender;
         Ok(GLASS_OK)
     })
 }

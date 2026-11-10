@@ -14,13 +14,14 @@ type RawHandler = Arc<Mutex<dyn FnMut(&[u8]) + Send>>;
 
 #[derive(Default)]
 pub(crate) struct EventSlot {
-    queue: VecDeque<Vec<u8>>,
+    /// Each event, with the client that sent it.
+    queue: VecDeque<(NodeId, Vec<u8>)>,
     handler: Option<RawHandler>,
 }
 
 /// Delivers an event from the server. The handler runs without the client lock
 /// so it can use the client's objects.
-pub(crate) fn deliver(core: &ClientCore, name: &str, data: Vec<u8>) {
+pub(crate) fn deliver(core: &ClientCore, name: &str, from: NodeId, data: Vec<u8>) {
     let mut state = core.state.lock().unwrap();
     let Some(slot) = state.events.get_mut(name) else {
         log::warn!("event {name} not found");
@@ -32,7 +33,7 @@ pub(crate) fn deliver(core: &ClientCore, name: &str, data: Vec<u8>) {
             (handler.lock().unwrap())(&data);
         }
         None => {
-            slot.queue.push_back(data);
+            slot.queue.push_back((from, data));
             drop(state);
             core.changed.notify_all();
         }
@@ -68,7 +69,7 @@ impl<T: Wire + 'static> Event<T> {
             Mode::Local => EventMsg::CreateLocal(name.to_owned()),
             Mode::Global => EventMsg::CreateGlobal(name.to_owned()),
         };
-        if let Err(e) = core.send_to_server(EVENT_PLUGIN_ID, msg.encode()) {
+        if let Err(e) = core.register(EVENT_PLUGIN_ID, name, msg.encode()) {
             core.state.lock().unwrap().events.remove(name);
             return Err(e);
         }
@@ -97,8 +98,9 @@ impl<T: Wire + 'static> Event<T> {
         let msg = EventMsg::Event(self.name.clone(), bytes.clone());
         self.core
             .send(EVENT_PLUGIN_ID, msg.encode(), targets.clone())?;
-        if send_to_self && (targets.contains(&EVERYBODY_ID) || targets.contains(&self.core.id())) {
-            deliver(&self.core, &self.name, bytes);
+        let own = self.core.id();
+        if send_to_self && (targets.contains(&EVERYBODY_ID) || targets.contains(&own)) {
+            deliver(&self.core, &self.name, own, bytes);
         }
         Ok(())
     }
@@ -115,19 +117,30 @@ impl<T: Wire + 'static> Event<T> {
 
     /// Removes the first event in the queue, if any.
     pub fn try_get(&self) -> Result<Option<T>> {
+        Ok(self.try_get_with_sender()?.map(|(_, value)| value))
+    }
+
+    /// Removes the first event in the queue, if any, with the client that sent it.
+    pub fn try_get_with_sender(&self) -> Result<Option<(NodeId, T)>> {
         let mut state = self.core.state.lock().unwrap();
         let slot = state
             .events
             .get_mut(&self.name)
             .ok_or(Error::Disconnected)?;
         match slot.queue.pop_front() {
-            Some(bytes) => T::unpack(&bytes).map(Some).ok_or(Error::Decode),
+            Some((from, bytes)) => Ok(Some((from, T::unpack(&bytes).ok_or(Error::Decode)?))),
             None => Ok(None),
         }
     }
 
     /// Waits for an event and removes it from the queue.
     pub fn get_timeout(&self, timeout: Duration) -> Result<T> {
+        Ok(self.get_with_sender_timeout(timeout)?.1)
+    }
+
+    /// Waits for an event and removes it from the queue, and tells which client sent
+    /// it. The server writes the sender, so a client cannot pass for another.
+    pub fn get_with_sender_timeout(&self, timeout: Duration) -> Result<(NodeId, T)> {
         let deadline = Instant::now() + timeout;
         let mut state = self.core.state.lock().unwrap();
         loop {
@@ -135,8 +148,8 @@ impl<T: Wire + 'static> Event<T> {
                 .events
                 .get_mut(&self.name)
                 .ok_or(Error::Disconnected)?;
-            if let Some(bytes) = slot.queue.pop_front() {
-                return T::unpack(&bytes).ok_or(Error::Decode);
+            if let Some((from, bytes)) = slot.queue.pop_front() {
+                return Ok((from, T::unpack(&bytes).ok_or(Error::Decode)?));
             }
             if state.closed {
                 return Err(Error::Disconnected);
@@ -186,7 +199,7 @@ impl<T: Wire + 'static> Event<T> {
             slot.handler = Some(raw.clone());
             std::mem::take(&mut slot.queue)
         };
-        for bytes in pending {
+        for (_, bytes) in pending {
             (raw.lock().unwrap())(&bytes);
         }
     }
@@ -204,6 +217,7 @@ impl<T> Drop for Event<T> {
     fn drop(&mut self) {
         self.core.state.lock().unwrap().events.remove(&self.name);
         let msg = EventMsg::Delete(self.name.clone());
+        self.core.unregister(EVENT_PLUGIN_ID, &self.name);
         let _ = self.core.send_to_server(EVENT_PLUGIN_ID, msg.encode());
     }
 }
@@ -254,7 +268,9 @@ impl EventServer {
                     black: BTreeSet::from([source.id]),
                     white: owners.ids(),
                     links: owners.forward_links(source.relation),
-                    from: None,
+                    // The client that sent it, which the server knows by its connection,
+                    // or which another server told.
+                    from: Some(source.origin),
                     unreliable: false,
                 }])
             }
@@ -323,6 +339,7 @@ mod tests {
         let out = server.on_packet(client(A), &targets(), &msg).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].payload, msg);
+        assert_eq!(out[0].from, Some(A), "it goes with the id of its sender");
         assert_eq!(out[0].black, BTreeSet::from([A]));
         assert_eq!(out[0].white, BTreeSet::from([A, B]));
         assert_eq!(out[0].links, Links::NONE);

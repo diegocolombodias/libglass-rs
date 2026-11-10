@@ -47,7 +47,7 @@ impl<T: Clone> Alias<T> {
             Mode::Local => AliasMsg::CreateLocal(name.to_owned()),
             Mode::Global => AliasMsg::CreateGlobal(name.to_owned()),
         };
-        if let Err(e) = core.send_to_server(ALIAS_PLUGIN_ID, msg.encode()) {
+        if let Err(e) = core.register(ALIAS_PLUGIN_ID, name, msg.encode()) {
             core.state.lock().unwrap().aliases.remove(name);
             return Err(e);
         }
@@ -121,6 +121,7 @@ impl<T> Drop for Alias<T> {
     fn drop(&mut self) {
         self.core.state.lock().unwrap().aliases.remove(&self.name);
         let msg = AliasMsg::Delete(self.name.clone());
+        self.core.unregister(ALIAS_PLUGIN_ID, &self.name);
         let _ = self.core.send_to_server(ALIAS_PLUGIN_ID, msg.encode());
     }
 }
