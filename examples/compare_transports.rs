@@ -29,8 +29,10 @@ use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-/// Time for the server to know about new objects.
-const SETTLE: Duration = Duration::from_millis(300);
+/// How long a server may take to learn about new objects, which may need retransmissions.
+const ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The sequence number of a probe, a message that only checks that the way is open.
+const PROBE: u64 = u64::MAX;
 const POLL: Duration = Duration::from_millis(50);
 /// How long a message of a reliable protocol may take, which is a failure if exceeded.
 const RELIABLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -261,6 +263,37 @@ fn sequence_of(message: &Bytes) -> u64 {
     u64::from_be_bytes(message.0[..SEQUENCE_LEN].try_into().unwrap())
 }
 
+/// A probe has only a sequence number, so it is shorter than any measured message.
+fn probe() -> Bytes {
+    Bytes(PROBE.to_be_bytes().to_vec())
+}
+
+fn is_probe(message: &Bytes) -> bool {
+    message.0.len() == SEQUENCE_LEN && sequence_of(message) == PROBE
+}
+
+/// Waits until messages sent through `from` reach `to`. A server only delivers an event
+/// to clients whose object it knows, and on a lossy network the message that creates it
+/// may arrive late; a fixed pause would make the first messages of a test disappear.
+/// Probes that arrive later are skipped by the tests.
+fn wait_for_route(
+    protocol: Protocol,
+    from: &Event<Bytes>,
+    to: &Event<Bytes>,
+    target: NodeId,
+) -> Result<()> {
+    let deadline = Instant::now() + ROUTE_TIMEOUT;
+    while Instant::now() < deadline {
+        protocol.send(from, &probe(), target)?;
+        match to.get_timeout(POLL) {
+            Ok(message) if is_probe(&message) => return Ok(()),
+            Ok(_) | Err(GlassError::Timeout) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err("the server did not deliver between the two clients".into())
+}
+
 /// The sequence number of a message, if the rest of it is what was sent.
 fn check(message: &Bytes, expected: &Bytes) -> std::result::Result<u64, String> {
     if message.0.len() != expected.0.len() {
@@ -287,6 +320,37 @@ struct Measures {
     rates: Vec<f64>,
     sent: usize,
     received: usize,
+    /// Attempts to connect that failed, and were made again.
+    failed_connections: usize,
+}
+
+/// How many times to try to connect a pair, as a lossy network can lose a handshake.
+const CONNECT_ATTEMPTS: usize = 5;
+
+/// Connects a pair, trying again if it fails, and counts the failures.
+fn connect_pair(
+    protocol: Protocol,
+    remote: Option<&str>,
+    fingerprint: Option<&str>,
+    measures: &mut Measures,
+) -> Result<Pair> {
+    let mut attempt = 1;
+    loop {
+        match Pair::new(protocol, remote, fingerprint) {
+            Ok(pair) => return Ok(pair),
+            Err(e) if attempt == CONNECT_ATTEMPTS => {
+                return Err(format!(
+                    "{}: {attempt} attempts to connect failed: {e}",
+                    protocol.name()
+                )
+                .into())
+            }
+            Err(_) => {
+                measures.failed_connections += 1;
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// Sends one message at a time and waits for the other client to send it back.
@@ -299,8 +363,9 @@ fn measure_round_trips(
 ) -> Result<()> {
     let (ping_a, ping_b) = pair.events()?;
     let (pong_a, pong_b) = pair.events()?;
-    thread::sleep(SETTLE);
     let (a_id, b_id) = (pair.a.id(), pair.b.id());
+    wait_for_route(protocol, &ping_a, &ping_b, b_id)?;
+    wait_for_route(protocol, &pong_b, &pong_a, a_id)?;
     let expected = template(size);
     let reply_timeout = if protocol.is_reliable() {
         RELIABLE_TIMEOUT
@@ -333,6 +398,7 @@ fn measure_round_trips(
                 loop {
                     let remaining = reply_timeout.saturating_sub(start.elapsed());
                     match pong_a.get_timeout(remaining) {
+                        Ok(reply) if is_probe(&reply) => {}
                         Ok(reply) => {
                             // A late reply to a message already counted as lost.
                             if check(&reply, &expected)? == sequence {
@@ -366,8 +432,8 @@ fn measure_burst(
     measures: &mut Measures,
 ) -> Result<()> {
     let (event_a, event_b) = pair.events()?;
-    thread::sleep(SETTLE);
     let b_id = pair.b.id();
+    wait_for_route(protocol, &event_a, &event_b, b_id)?;
     let expected = template(size);
     let timeout = if protocol.is_reliable() {
         RELIABLE_TIMEOUT
@@ -382,6 +448,7 @@ fn measure_burst(
             let mut last_arrival = None;
             while received < messages {
                 match event_b.get_timeout(timeout) {
+                    Ok(message) if is_probe(&message) => {}
                     Ok(message) => {
                         let sequence = check(&message, &expected)?;
                         if protocol.is_reliable() && sequence != received as u64 {
@@ -450,7 +517,7 @@ fn print_row(load: &Load, protocol: Protocol, mut measures: Measures) {
     measures.rates.sort_by(f64::total_cmp);
     let rates = &measures.rates;
     println!(
-        "{:<7} {:<5} {:>11} {:>11} {:>8.1}% {:>9.1} {:>9.1} {:>9.1} {:>8.1}%",
+        "{:<7} {:<5} {:>11} {:>11} {:>8.1}% {:>9.1} {:>9.1} {:>9.1} {:>8.1}% {:>9}",
         load.label,
         protocol.name(),
         format_time(percentile(&measures.round_trips, 50)),
@@ -460,6 +527,7 @@ fn print_row(load: &Load, protocol: Protocol, mut measures: Measures) {
         rates[rates.len() / 2],
         rates[rates.len() - 1],
         percent_lost(measures.sent, measures.sent - measures.received),
+        measures.failed_connections,
     );
 }
 
@@ -513,7 +581,7 @@ fn run(
         remote.unwrap_or("this process")
     );
     println!(
-        "{:<7} {:<5} {:>11} {:>11} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "{:<7} {:<5} {:>11} {:>11} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "payload",
         "proto",
         "rtt median",
@@ -522,7 +590,8 @@ fn run(
         "rate min",
         "median",
         "max",
-        "lost"
+        "lost",
+        "conn fail"
     );
     if protocols.is_empty() {
         return Err("no protocol to measure".into());
@@ -541,7 +610,7 @@ fn run(
             for _ in 0..repeats {
                 let samples = (load.samples / divisor).max(2);
                 let messages = (load.messages / divisor).max(2);
-                let pair = Pair::new(protocol, remote, fingerprint)?;
+                let pair = connect_pair(protocol, remote, fingerprint, &mut measures)?;
                 measure_round_trips(protocol, &pair, samples, load.size, &mut measures)?;
                 measure_burst(protocol, &pair, messages, load.size, &mut measures)?;
             }
