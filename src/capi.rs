@@ -138,6 +138,12 @@ unsafe fn free<T>(pointer: *mut T) {
     }
 }
 
+/// How long connecting may take, for every connection opened from now on.
+#[no_mangle]
+pub extern "C" fn glass_set_connect_timeout(timeout_ms: u64) {
+    crate::set_connect_timeout(millis(timeout_ms));
+}
+
 #[no_mangle]
 pub extern "C" fn glass_last_error() -> *const c_char {
     LAST_ERROR.with(|last| last.borrow().as_ptr())
@@ -505,6 +511,19 @@ pub unsafe extern "C" fn glass_barrier_new(
 pub unsafe extern "C" fn glass_barrier_sync(barrier: *const Barrier) -> c_int {
     guard_status(|| {
         object(barrier)?.sync()?;
+        Ok(GLASS_OK)
+    })
+}
+
+/// # Safety
+/// `barrier` must come from this library, and not be freed during this call.
+#[no_mangle]
+pub unsafe extern "C" fn glass_barrier_sync_timeout(
+    barrier: *const Barrier,
+    timeout_ms: u64,
+) -> c_int {
+    guard_status(|| {
+        object(barrier)?.sync_timeout(millis(timeout_ms))?;
         Ok(GLASS_OK)
     })
 }

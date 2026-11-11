@@ -668,7 +668,7 @@ impl Joining {
 
     /// One attempt to join. Gives `None` if the id is taken.
     fn try_join(&self, stream: Stream, id: &mut NodeId) -> Result<Option<Vec<Joined>>> {
-        let (conn, mut reader) = Conn::new(stream)?;
+        let (conn, mut reader) = Conn::new_queued(stream)?;
         let addr = advertised_addr(self.listen, &conn);
         send_root(&conn, *id, RootMsg::PeerStart(self.kind, addr, self.nonce))?;
 
@@ -734,7 +734,7 @@ impl Joining {
         addr: &PeerAddr,
     ) -> Result<Option<(Arc<Conn>, Stream, u64)>> {
         let stream = self.transport.connect((addr.host.as_str(), addr.port))?;
-        let (conn, mut reader) = Conn::new(stream)?;
+        let (conn, mut reader) = Conn::new_queued(stream)?;
         let own = advertised_addr(self.listen, &conn);
         send_root(
             &conn,
@@ -796,7 +796,7 @@ fn accept_loop(
 }
 
 fn start_connection(stream: Stream, id: ConnId, tx: &Sender<Incoming>) -> Result<()> {
-    let (conn, reader) = Conn::new(stream)?;
+    let (conn, reader) = Conn::new_queued(stream)?;
     if tx.send(Incoming::Accepted(id, conn)).is_err() {
         return Err(Error::Disconnected);
     }
@@ -1182,7 +1182,7 @@ impl Dispatcher {
             RootMsg::Id(new_id).encode(),
             new_id,
         ));
-        self.update_clients();
+        self.announce_join(new_id);
     }
 
     /// A new server wants to join the group through this one.
@@ -1418,23 +1418,37 @@ impl Dispatcher {
         }
         self.send_all(out);
         if relation == Relation::Client {
-            self.update_clients();
+            let master = self.directory.lock().unwrap().master;
+            let left = RootMsg::MemberLeft { id, master };
+            self.send(Outbound::to_node(ROOT_PLUGIN_ID, left.encode(), CLIENTS_ID));
         }
     }
 
-    fn update_clients(&mut self) {
-        let list = {
+    /// Gives a new client the whole list of clients, and tells the others only about it,
+    /// so that what a join costs does not grow with the number of clients.
+    fn announce_join(&mut self, new_id: NodeId) {
+        let (members, joined) = {
             let directory = self.directory.lock().unwrap();
-            RootMsg::NodeList {
+            let nodes: BTreeMap<NodeId, String> = directory
+                .clients
+                .iter()
+                .map(|(&id, client)| (id, client.nickname.clone()))
+                .collect();
+            let joined = RootMsg::MemberJoined {
+                id: new_id,
+                nickname: nodes[&new_id].clone(),
                 master: directory.master,
-                nodes: directory
-                    .clients
-                    .iter()
-                    .map(|(&id, client)| (id, client.nickname.clone()))
-                    .collect(),
-            }
+            };
+            let members = RootMsg::Members {
+                master: directory.master,
+                nodes,
+            };
+            (members, joined)
         };
-        self.send(Outbound::to_node(ROOT_PLUGIN_ID, list.encode(), CLIENTS_ID));
+        self.send(Outbound::to_node(ROOT_PLUGIN_ID, members.encode(), new_id));
+        let mut out = Outbound::to_node(ROOT_PLUGIN_ID, joined.encode(), CLIENTS_ID);
+        out.black.insert(new_id);
+        self.send(out);
     }
 
     fn send_all(&mut self, outbound: Vec<Outbound>) {

@@ -33,6 +33,14 @@ Cada objeto do cliente conversa com o plugin de mesmo nome no servidor. Toda a l
 servidor roda em uma única thread, que processa um pacote de cada vez, então os plugins não
 precisam de locks.
 
+Essa thread não escreve nas conexões: cada uma tem uma fila e uma thread que escreve. Assim,
+um cliente que lê devagar só atrasa os próprios pacotes. Se ele ficar 64 MiB para trás, ou
+30 s sem conseguir receber nada, o servidor o desconecta.
+
+Quando um cliente entra, ele recebe a lista de clientes, e os outros recebem só o novo
+cliente; quando sai, os outros recebem só a saída. O custo de uma entrada não cresce com o
+número de clientes.
+
 ## Objetos
 
 | Tipo | Para que serve |
@@ -325,8 +333,9 @@ Veja [sync.rs](examples/render_wall/sync.rs).
 
 - Um nó pode entrar ou cair a qualquer momento, e a tela é redividida entre os restantes.
 - O nó mais lento dita a velocidade de todos. Para simular isso, use `--delay-ms`.
-- Um nó travado, mas ainda conectado, para a parede inteira, porque `Barrier::sync` não tem
-  timeout.
+- Um nó travado, mas ainda conectado, para a parede inteira, porque ela usa `Barrier::sync`,
+  que espera sem prazo. `Barrier::sync_timeout` desiste depois de um prazo, e o cliente
+  continua contando como chegado: a próxima chamada espera a mesma liberação.
 - Para testar com carga, use `--cubes`. As demais opções aparecem ao rodar sem argumentos.
 
 **Teste de ponta a ponta.** Abre janelas de verdade e verifica se os tiles juntos formam a
@@ -347,6 +356,11 @@ docker run --rm -v "${PWD}:/src:ro" -v "${PWD}/tests/render_wall/output:/out" ru
 ```
 
 ## Limitações
+
+- Conectar desiste depois de 10 s, para clientes e para servidores que entram num grupo. O
+  prazo é do processo inteiro e muda com `set_connect_timeout` (`glass_set_connect_timeout` em
+  C, `libglass.set_connect_timeout` em Python). Com 3 s, como antes, uma rede com 1% de perda
+  impedia o SCTP de conectar, porque ele só repete o início da conexão depois de 3 s.
 
 - Quando a ligação entre dois servidores cai sem que eles tenham saído, o de menor id tenta
   refazê-la por até 30 s. O que foi enviado enquanto ela estava fora se perde.

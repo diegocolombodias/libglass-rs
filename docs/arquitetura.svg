@@ -84,7 +84,7 @@
   <text class="sub" x="349" y="527">opcional; uma thread lê</text>
   <rect class="box" x="462" y="486" width="202" height="56" rx="4"/>
   <text class="name" x="563" y="509">Envio</text>
-  <text class="sub" x="563" y="527">para clientes e servidores</text>
+  <text class="sub" x="563" y="527">uma fila e uma thread por conexão</text>
 
   <path class="line" marker-end="url(#arrow)" d="M141 542 V564"/>
   <path class="line" marker-end="url(#arrow)" d="M349 542 V564"/>

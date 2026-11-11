@@ -102,6 +102,8 @@ _declare("shared_get_update", c_int, c_void_p)
 _declare("shared_free", None, c_void_p)
 _declare("barrier_new", c_void_p, c_void_p, c_uint32, c_uint32, c_int, c_int)
 _declare("barrier_sync", c_int, c_void_p)
+_declare("barrier_sync_timeout", c_int, c_void_p, c_uint64)
+_declare("set_connect_timeout", None, c_uint64)
 _declare("barrier_free", None, c_void_p)
 _declare("messenger_new", c_void_p, c_void_p, c_char_p, c_int)
 _declare("messenger_send", c_int, c_void_p, c_uint32, c_char_p, c_size_t)
@@ -147,6 +149,11 @@ def _take(function, *args):
 
 def _millis(timeout):
     return int(timeout * 1000)
+
+
+def set_connect_timeout(seconds):
+    """How long connecting may take, for every connection opened from now on."""
+    _lib.glass_set_connect_timeout(_millis(seconds))
 
 
 class _Object:
@@ -288,8 +295,13 @@ class Barrier(_Object):
             _lib.glass_barrier_new(client._pointer, number, group, active, is_global)
         )
 
-    def sync(self):
-        _check(_lib.glass_barrier_sync(self._pointer))
+    def sync(self, timeout=None):
+        """Waits for the others. With a timeout, raises Timeout if they take longer, and
+        still counts as arrived: the next call waits for the same release."""
+        if timeout is None:
+            _check(_lib.glass_barrier_sync(self._pointer))
+        else:
+            _check(_lib.glass_barrier_sync_timeout(self._pointer, _millis(timeout)))
 
 
 class Messenger(_Object):

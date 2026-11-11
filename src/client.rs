@@ -13,14 +13,14 @@ use crate::quic::QuicTrust;
 use crate::remote::RemoteSlot;
 use crate::server::{wake_udp, MAX_DATAGRAM_SIZE};
 use crate::shared::SharedSlot;
-use crate::transport::Stream;
 #[cfg(any(unix, feature = "quic"))]
 use crate::transport::Transport;
+use crate::transport::{connect_tcp, Stream};
 use crate::types::*;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -176,7 +176,7 @@ impl GlassClient {
     /// Connects to a server. Returns only after the handshake has finished.
     pub fn connect<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
         let addrs: Vec<SocketAddr> = server.to_socket_addrs()?.collect();
-        let stream = Stream::Tcp(TcpStream::connect(&addrs[..])?);
+        let stream = Stream::Tcp(connect_tcp(&addrs[..])?);
         GlassClient::from_stream(stream, nickname, tcp_dial(addrs))
     }
 
@@ -219,7 +219,7 @@ impl GlassClient {
     /// and everything goes through TCP: see [`uses_udp`](Self::uses_udp).
     pub fn connect_with_udp<A: ToSocketAddrs>(server: A, nickname: &str) -> Result<GlassClient> {
         let addrs: Vec<SocketAddr> = server.to_socket_addrs()?.collect();
-        let stream = TcpStream::connect(&addrs[..])?;
+        let stream = connect_tcp(&addrs[..])?;
         let server_ip = stream.peer_addr()?.ip();
         let local_ip = stream.local_addr()?.ip();
         let mut client = GlassClient::from_stream(Stream::Tcp(stream), nickname, tcp_dial(addrs))?;
@@ -497,7 +497,7 @@ fn handshake(core: &ClientCore, reader: &mut Stream) -> Result<()> {
                 core.state.lock().unwrap().server_id = packet.from;
                 has_id = true;
             }
-            RootMsg::NodeList { master, nodes } => {
+            RootMsg::NodeList { master, nodes } | RootMsg::Members { master, nodes } => {
                 let mut state = core.state.lock().unwrap();
                 state.master = master;
                 state.nodes = nodes;
@@ -742,10 +742,26 @@ fn on_remote(core: &ClientCore, from: NodeId, msg: RemoteMsg) {
 
 fn on_root(core: &ClientCore, packet: &Packet) -> bool {
     match RootMsg::decode(&packet.payload) {
-        Ok(RootMsg::NodeList { master, nodes }) => {
+        Ok(RootMsg::NodeList { master, nodes }) | Ok(RootMsg::Members { master, nodes }) => {
             let mut state = core.state.lock().unwrap();
             state.master = master;
             state.nodes = nodes;
+            true
+        }
+        Ok(RootMsg::MemberJoined {
+            id,
+            nickname,
+            master,
+        }) => {
+            let mut state = core.state.lock().unwrap();
+            state.nodes.insert(id, nickname);
+            state.master = master;
+            true
+        }
+        Ok(RootMsg::MemberLeft { id, master }) => {
+            let mut state = core.state.lock().unwrap();
+            state.nodes.remove(&id);
+            state.master = master;
             true
         }
         Ok(RootMsg::QuitAll) | Ok(RootMsg::Bye) => false,
@@ -771,7 +787,7 @@ fn on_root(core: &ClientCore, packet: &Packet) -> bool {
 }
 
 fn tcp_dial(addrs: Vec<SocketAddr>) -> Dial {
-    Box::new(move || TcpStream::connect(&addrs[..]).map(Stream::Tcp))
+    Box::new(move || connect_tcp(&addrs[..]).map(Stream::Tcp))
 }
 
 fn retry(

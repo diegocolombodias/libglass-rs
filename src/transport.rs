@@ -8,12 +8,37 @@ use std::io::{self, ErrorKind, Read, Write};
 #[cfg(any(unix, feature = "quic"))]
 use std::net::SocketAddr;
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long connecting may take, in milliseconds. On a lossy network a handshake may be
+/// lost: TCP sends it again after 1 s and then 3 s, and SCTP after 3 s.
+static CONNECT_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
+
+/// How long connecting to a server may take, for clients and for servers joining a
+/// group: 10 s, unless changed with [`set_connect_timeout`].
+pub fn connect_timeout() -> Duration {
+    Duration::from_millis(CONNECT_TIMEOUT_MS.load(Ordering::Relaxed))
+}
+
+/// Changes how long connecting may take, for every connection that this process opens
+/// from now on.
+pub fn set_connect_timeout(timeout: Duration) {
+    let millis = timeout.as_millis().clamp(1, u64::MAX as u128) as u64;
+    CONNECT_TIMEOUT_MS.store(millis, Ordering::Relaxed);
+}
+
+/// Connects through TCP to the first address that answers, within the timeout.
+pub(crate) fn connect_tcp<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
+    match Transport::Tcp.connect(addr)? {
+        Stream::Tcp(stream) => Ok(stream),
+        #[allow(unreachable_patterns)]
+        _ => unreachable!("TCP gives a TCP stream"),
+    }
+}
 #[cfg(unix)]
 const LISTEN_BACKLOG: i32 = 128;
 #[cfg(unix)]
@@ -45,13 +70,13 @@ impl Transport {
         for addr in addr.to_socket_addrs()? {
             let stream = match self {
                 Transport::Tcp => {
-                    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map(Stream::Tcp)
+                    TcpStream::connect_timeout(&addr, connect_timeout()).map(Stream::Tcp)
                 }
                 #[cfg(unix)]
                 Transport::Sctp => connect_sctp(addr).map(Stream::Sctp),
                 #[cfg(feature = "quic")]
                 Transport::Quic(trust) => {
-                    quic::connect(addr, trust, CONNECT_TIMEOUT).map(Stream::Quic)
+                    quic::connect(addr, trust, connect_timeout()).map(Stream::Quic)
                 }
             };
             match stream {
@@ -72,7 +97,7 @@ fn sctp_socket(addr: SocketAddr) -> io::Result<Socket> {
 #[cfg(unix)]
 fn connect_sctp(addr: SocketAddr) -> io::Result<Socket> {
     let socket = sctp_socket(addr)?;
-    socket.connect_timeout(&addr.into(), CONNECT_TIMEOUT)?;
+    socket.connect_timeout(&addr.into(), connect_timeout())?;
     Ok(socket)
 }
 

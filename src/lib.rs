@@ -51,6 +51,7 @@ pub use server::{GlassServer, PeerInfo};
 pub use shared::{Shared, UpdateMode};
 pub use shm::SharedRegion;
 pub use stream::Stream;
+pub use transport::{connect_timeout, set_connect_timeout};
 pub use types::*;
 #[cfg(feature = "serde")]
 pub use wire::Serde;

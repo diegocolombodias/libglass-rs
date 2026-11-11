@@ -213,17 +213,18 @@ fn peer_with_unreachable_seed_starts_a_new_group() {
     let identity = QuicIdentity::generate().unwrap();
     let start = Instant::now();
     let peer = GlassServer::bind_peer_quic("127.0.0.1:0", Some(&seed), &identity).unwrap();
-    assert!(start.elapsed() < TIMEOUT);
+    // UDP has no refusal, so it takes the whole connect timeout.
+    assert!(start.elapsed() < connect_timeout() + Duration::from_secs(2));
     assert!(peer.peers().is_empty());
     assert!(client(&peer, "a").is_master());
 }
 
 #[test]
-fn connecting_to_nothing_is_an_error_within_a_few_seconds() {
+fn connecting_to_nothing_is_an_error_within_the_connect_timeout() {
     let start = Instant::now();
     let trust = QuicTrust::AnyCertificate;
     assert!(GlassClient::connect_quic(unused_addr(), "a", trust).is_err());
-    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(start.elapsed() < connect_timeout() + Duration::from_secs(2));
 }
 
 #[test]

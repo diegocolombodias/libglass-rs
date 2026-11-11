@@ -38,6 +38,9 @@ typedef struct GlassAlias GlassAlias;
 const char *glass_last_error(void);
 void glass_free_bytes(uint8_t *data, size_t len);
 
+/* How long connecting may take, for every connection opened from now on (10 s). */
+void glass_set_connect_timeout(uint64_t timeout_ms);
+
 /* Addresses are "host:port". Port 0 lets the system choose. */
 GlassServer *glass_server_new(const char *addr);
 /* seed is any server of the group, or NULL to start a new one. */
@@ -88,6 +91,9 @@ void glass_shared_free(GlassShared *shared);
 GlassBarrier *glass_barrier_new(const GlassClient *client, uint32_t number,
                                 uint32_t group, int active, int global);
 int glass_barrier_sync(const GlassBarrier *barrier);
+/* Gives up after timeout_ms, still counting as arrived: the next call waits for the
+ * same release. Returns GLASS_EMPTY if it gave up. */
+int glass_barrier_sync_timeout(const GlassBarrier *barrier, uint64_t timeout_ms);
 void glass_barrier_free(GlassBarrier *barrier);
 
 GlassMessenger *glass_messenger_new(const GlassClient *client, const char *name,

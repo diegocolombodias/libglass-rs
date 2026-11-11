@@ -109,12 +109,29 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 pub enum RootMsg {
     /// Server to client: this is your id.
     Id(NodeId),
-    /// Server to client: the current clients and which one is the master.
+    /// Server to client: the current clients and which one is the master, with a
+    /// fixed field for each nickname, as in the C++ library.
     NodeList {
         master: NodeId,
         nodes: BTreeMap<NodeId, String>,
     },
     SetMaster,
+    /// Server to a client that has just connected: the current clients, with the master.
+    Members {
+        master: NodeId,
+        nodes: BTreeMap<NodeId, String>,
+    },
+    /// Server to the other clients: a client has connected.
+    MemberJoined {
+        id: NodeId,
+        nickname: String,
+        master: NodeId,
+    },
+    /// Server to the clients: a client has left, and who the master is now.
+    MemberLeft {
+        id: NodeId,
+        master: NodeId,
+    },
     /// Client to server: first packet of a connection.
     Hello(String),
     /// Client to server: first packet of a connection that replaces a lost one. The
@@ -187,6 +204,35 @@ impl RootMsg {
                 out
             }
             RootMsg::UdpReady => vec![8],
+            RootMsg::Members { master, nodes } => {
+                let mut out = vec![10];
+                out.extend_from_slice(&master.to_be_bytes());
+                out.extend_from_slice(&(nodes.len() as u32).to_be_bytes());
+                for (id, nickname) in nodes {
+                    let nick = truncated(nickname);
+                    out.extend_from_slice(&id.to_be_bytes());
+                    out.push(nick.len() as u8);
+                    out.extend_from_slice(nick.as_bytes());
+                }
+                out
+            }
+            RootMsg::MemberJoined {
+                id,
+                nickname,
+                master,
+            } => {
+                let mut out = vec![11];
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(&master.to_be_bytes());
+                out.extend_from_slice(truncated(nickname).as_bytes());
+                out
+            }
+            RootMsg::MemberLeft { id, master } => {
+                let mut out = vec![12];
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(&master.to_be_bytes());
+                out
+            }
             RootMsg::HelloAgain(nickname, id) => {
                 let mut out = vec![9];
                 out.extend_from_slice(&id.to_be_bytes());
@@ -268,6 +314,34 @@ impl RootMsg {
                 )))
             }
             8 => Ok(RootMsg::UdpReady),
+            10 => {
+                let master = read_u32(bytes, 1)?;
+                let count = read_u32(bytes, 5)? as usize;
+                let mut nodes = BTreeMap::new();
+                let mut at = 9;
+                for _ in 0..count {
+                    let id = read_u32(bytes, at)?;
+                    let len = *bytes
+                        .get(at + 4)
+                        .ok_or(Error::InvalidPacket("truncated member list"))?
+                        as usize;
+                    let nick = bytes
+                        .get(at + 5..at + 5 + len)
+                        .ok_or(Error::InvalidPacket("truncated member list"))?;
+                    nodes.insert(id, String::from_utf8_lossy(nick).into_owned());
+                    at += 5 + len;
+                }
+                Ok(RootMsg::Members { master, nodes })
+            }
+            11 => Ok(RootMsg::MemberJoined {
+                id: read_u32(bytes, 1)?,
+                master: read_u32(bytes, 5)?,
+                nickname: String::from_utf8_lossy(&bytes[9..]).into_owned(),
+            }),
+            12 => Ok(RootMsg::MemberLeft {
+                id: read_u32(bytes, 1)?,
+                master: read_u32(bytes, 5)?,
+            }),
             9 => Ok(RootMsg::HelloAgain(
                 String::from_utf8_lossy(bytes.get(5..).unwrap_or_default()).into_owned(),
                 read_u32(bytes, 1)?,
@@ -643,6 +717,54 @@ mod tests {
         assert_eq!(bytes[9..14], [0, 1, 0, 1, b'a']);
         assert_eq!(bytes[14], 0);
         assert_eq!(RootMsg::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn member_messages_only_carry_what_they_need() {
+        let members = RootMsg::Members {
+            master: 0x10001,
+            nodes: BTreeMap::from([(0x10001, "a".to_owned()), (0x10002, "bc".to_owned())]),
+        };
+        let bytes = members.encode();
+        assert_eq!(bytes.len(), 9 + (5 + 1) + (5 + 2));
+        assert_eq!(RootMsg::decode(&bytes).unwrap(), members);
+
+        let joined = RootMsg::MemberJoined {
+            id: 0x10003,
+            nickname: "ana".into(),
+            master: 0x10001,
+        };
+        assert_eq!(joined.encode().len(), 9 + 3);
+        assert_eq!(RootMsg::decode(&joined.encode()).unwrap(), joined);
+
+        let left = RootMsg::MemberLeft {
+            id: 0x10001,
+            master: 0x10002,
+        };
+        assert_eq!(left.encode(), [12, 0, 1, 0, 1, 0, 1, 0, 2]);
+        assert_eq!(RootMsg::decode(&left.encode()).unwrap(), left);
+    }
+
+    #[test]
+    fn member_list_with_lying_count_or_length_is_rejected() {
+        let mut bytes = RootMsg::Members {
+            master: 0,
+            nodes: BTreeMap::from([(0x10001, "a".to_owned())]),
+        }
+        .encode();
+        bytes[5..9].copy_from_slice(&2u32.to_be_bytes());
+        assert!(
+            RootMsg::decode(&bytes).is_err(),
+            "a second member that is not there"
+        );
+        bytes[5..9].copy_from_slice(&1u32.to_be_bytes());
+        bytes[13] = 200;
+        assert!(
+            RootMsg::decode(&bytes).is_err(),
+            "a nickname longer than the packet"
+        );
+        assert!(RootMsg::decode(&[11, 0, 1]).is_err());
+        assert!(RootMsg::decode(&[12, 0, 1, 0, 1]).is_err());
     }
 
     #[test]

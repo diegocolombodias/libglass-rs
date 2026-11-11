@@ -31,6 +31,9 @@ serde = ["dep:serde", "dep:bincode"]
 # Adds QUIC, through quinn and rustls, with a tokio runtime on background threads.
 quic = ["dep:quinn", "dep:rcgen", "dep:ring", "dep:rustls", "dep:tokio"]
 
+[target.'cfg(unix)'.dev-dependencies]
+socket2 = "0.6"
+
 [dev-dependencies]
 glow = "0.18"
 glutin = "0.32"

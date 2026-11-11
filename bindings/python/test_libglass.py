@@ -108,6 +108,21 @@ class WithServer(unittest.TestCase):
         wait_until(lambda: not self.b.is_connected)
 
 
+class Timeouts(unittest.TestCase):
+    def test_barrier_gives_up_and_still_counts(self):
+        with libglass.Server() as server:
+            with libglass.Client(server.address, "a") as a, libglass.Client(server.address, "b") as b:
+                with libglass.Barrier(a) as barrier_a, libglass.Barrier(b) as barrier_b:
+                    time.sleep(SETTLE)
+                    with self.assertRaises(libglass.Timeout):
+                        barrier_a.sync(timeout=0.2)
+                    barrier_b.sync(timeout=10)
+                    barrier_a.sync(timeout=10)
+
+    def test_connect_timeout_can_be_set(self):
+        libglass.set_connect_timeout(10)
+
+
 class Reconnect(unittest.TestCase):
     def test_client_comes_back_to_a_restarted_server(self):
         server = libglass.Server()

@@ -6,11 +6,15 @@ use crate::protocol::{BarrierKind, BarrierMsg};
 use crate::types::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(crate) struct BarrierSlot {
     /// A sync is in progress. Other threads calling sync wait for the same one.
     pub(crate) syncing: bool,
+    /// A call gave up while this client had arrived. The next call does not arrive
+    /// again: it waits for that release, which may already have come.
+    gave_up: bool,
 }
 
 /// A synchronization point among the clients that created it.
@@ -118,10 +122,24 @@ impl Barrier {
 
     /// Blocks until all the clients with this barrier have called sync.
     pub fn sync(&self) -> Result<()> {
+        self.wait(None)
+    }
+
+    /// Like [`sync`](Self::sync), but gives up after `timeout` with
+    /// [`Error::Timeout`], so that a client that has stopped does not hold this one
+    /// forever. This client still counts as arrived: the barrier is released when the
+    /// others arrive, and the next call waits for that release, without arriving again.
+    pub fn sync_timeout(&self, timeout: Duration) -> Result<()> {
+        self.wait(Some(Instant::now() + timeout))
+    }
+
+    fn wait(&self, deadline: Option<Instant>) -> Result<()> {
         let key = (self.group, self.number);
         let mut state = self.core.state.lock().unwrap();
         let slot = state.barriers.get_mut(&key).ok_or(Error::Disconnected)?;
-        if !slot.syncing {
+        if slot.gave_up {
+            slot.gave_up = false;
+        } else if !slot.syncing {
             slot.syncing = true;
             drop(state);
             if let Err(e) = self.send(BarrierKind::Sync, false) {
@@ -143,7 +161,18 @@ impl Barrier {
             if state.closed {
                 return Err(Error::Disconnected);
             }
-            state = self.core.changed.wait(state).unwrap();
+            state = match deadline {
+                None => self.core.changed.wait(state).unwrap(),
+                Some(deadline) => {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        if let Some(slot) = state.barriers.get_mut(&key) {
+                            slot.gave_up = true;
+                        }
+                        return Err(Error::Timeout);
+                    };
+                    self.core.changed.wait_timeout(state, remaining).unwrap().0
+                }
+            };
         }
     }
 }
