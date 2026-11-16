@@ -51,7 +51,7 @@ número de clientes.
 | `Remote<T>` | Variável própria de cada cliente, que os outros leem e alteram pelo id |
 | `Barrier` | Ponto de sincronização, que pode ser desativado e reativado |
 | `Alias<T>` | Valor local escolhido pelo nome que o grupo deu a este nó |
-| `Stream` | Transferência de arquivos e outros dados grandes, em que quem envia fica no máximo 2 MiB à frente de quem recebe |
+| `Stream` | Transferência de arquivos e outros dados grandes, em que quem envia fica no máximo 2 MiB à frente de quem recebe; os pedaços são numerados, e uma transferência que chega incompleta dá erro em vez de terminar |
 | `EventSerializable` | Evento que carrega objetos de classes diferentes na mesma fila |
 | `SharedRegion` | Memória compartilhada entre processos da mesma máquina, sem rede |
 

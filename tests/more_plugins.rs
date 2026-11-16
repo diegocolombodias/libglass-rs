@@ -187,6 +187,53 @@ fn stream_transfers_large_data_intact() {
     assert!(received.is_empty());
 }
 
+/// A stream frame as the sender writes it: transfer, kind, and the index of a data
+/// frame or the number of data frames in the end frame.
+fn stream_frame(transfer: u32, kind: u8, index: u32, data: &[u8]) -> Bytes {
+    let mut out = transfer.to_be_bytes().to_vec();
+    out.push(kind);
+    out.extend_from_slice(&index.to_be_bytes());
+    out.extend_from_slice(data);
+    Bytes(out)
+}
+
+#[test]
+fn stream_reports_a_transfer_with_missing_pieces() {
+    let (_server, addr) = start_server();
+    let a = GlassClient::connect(addr, "a").unwrap();
+    let b = GlassClient::connect(addr, "b").unwrap();
+    // The frames of a stream named "s" travel through this messenger, so it can
+    // play a sender whose first piece was lost, as when it arrives before the
+    // receiver has created its stream.
+    let raw = Messenger::<Bytes>::new(&a, "stream:s", Mode::Local).unwrap();
+    let s_b = Stream::new(&b, "s", Mode::Local).unwrap();
+    thread::sleep(SETTLE);
+
+    raw.send(b.id(), &stream_frame(0, 0, 1, b"second")).unwrap();
+    raw.send(b.id(), &stream_frame(0, 1, 2, &[])).unwrap();
+    let mut received = Vec::new();
+    assert!(matches!(
+        s_b.receive(&mut received, TIMEOUT),
+        Err(Error::TransferIncomplete)
+    ));
+
+    // A piece lost at the end leaves no gap, but the count tells.
+    raw.send(b.id(), &stream_frame(1, 0, 0, b"first")).unwrap();
+    raw.send(b.id(), &stream_frame(1, 1, 2, &[])).unwrap();
+    let mut received = Vec::new();
+    assert!(matches!(
+        s_b.receive(&mut received, TIMEOUT),
+        Err(Error::TransferIncomplete)
+    ));
+
+    // A complete transfer still arrives.
+    raw.send(b.id(), &stream_frame(2, 0, 0, b"whole")).unwrap();
+    raw.send(b.id(), &stream_frame(2, 1, 1, &[])).unwrap();
+    let mut received = Vec::new();
+    assert_eq!(s_b.receive(&mut received, TIMEOUT).unwrap(), (a.id(), 5));
+    assert_eq!(received, b"whole");
+}
+
 #[test]
 fn stream_keeps_simultaneous_transfers_apart() {
     let (_server, addr) = start_server();

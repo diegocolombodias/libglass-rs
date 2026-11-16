@@ -35,6 +35,24 @@ fn frame(transfer: u32, kind: u8, data: &[u8]) -> Bytes {
     Bytes(out)
 }
 
+/// A data frame carries its index in the transfer, and the end frame the number of
+/// data frames, so that a receiver can tell that a piece is missing. One can be lost
+/// when it reaches the receiver before its stream exists there.
+fn numbered(transfer: u32, kind: u8, index: u32, data: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(9 + data.len());
+    out.extend_from_slice(&transfer.to_be_bytes());
+    out.push(kind);
+    out.extend_from_slice(&index.to_be_bytes());
+    out.extend_from_slice(data);
+    Bytes(out)
+}
+
+/// The index or count at the start of a numbered frame, and what follows it.
+fn split_index(data: &[u8]) -> Option<(u32, &[u8])> {
+    let index = u32::from_be_bytes(data.get(..4)?.try_into().ok()?);
+    Some((index, &data[4..]))
+}
+
 /// A transfer: the node that sends it, and its number there.
 type Key = (NodeId, u32);
 
@@ -239,11 +257,12 @@ impl Stream {
                 return Err(e);
             }
             self.messenger
-                .send(id, &frame(transfer, KIND_DATA, &buffer[..n]))?;
+                .send(id, &numbered(transfer, KIND_DATA, sent as u32, &buffer[..n]))?;
             total += n as u64;
             sent += 1;
         }
-        self.messenger.send(id, &frame(transfer, KIND_END, &[]))?;
+        self.messenger
+            .send(id, &numbered(transfer, KIND_END, sent as u32, &[]))?;
         Ok(total)
     }
 
@@ -257,10 +276,13 @@ impl Stream {
     /// transfer. Transfers from different nodes can arrive at the same time, and
     /// they are received one by one, in the order in which they started.
     ///
-    /// If writing fails, the sender is told to stop.
+    /// If writing fails, the sender is told to stop. If a piece of the transfer is
+    /// missing, the sender is told to stop too, and the result is
+    /// [`Error::TransferIncomplete`]: what was written is not the whole transfer.
     pub fn receive<W: Write>(&self, writer: &mut W, timeout: Duration) -> Result<(NodeId, u64)> {
         let _receiving = self.receiving.lock().unwrap();
         let mut total = 0u64;
+        let mut next = 0u32;
         let mut deadline = Instant::now() + timeout;
         let mut inbox = self.inbox.0.lock().unwrap();
         loop {
@@ -277,17 +299,27 @@ impl Stream {
                 KIND_DATA => {
                     // Writing may be slow, and the reading thread must not wait for it.
                     drop(inbox);
-                    if let Err(e) = writer.write_all(&data) {
+                    let Some((index, piece)) = split_index(&data).filter(|(i, _)| *i == next)
+                    else {
+                        self.give_up(key);
+                        return Err(Error::TransferIncomplete);
+                    };
+                    if let Err(e) = writer.write_all(piece) {
                         self.give_up(key);
                         return Err(e.into());
                     }
-                    total += data.len() as u64;
+                    next = index + 1;
+                    total += piece.len() as u64;
                     let _ = self.messenger.send(key.0, &frame(key.1, KIND_ACK, &[]));
                     inbox = self.inbox.0.lock().unwrap();
                 }
                 KIND_END => {
                     inbox.pending.forget(key);
-                    return Ok((key.0, total));
+                    // Pieces lost at the end leave no gap, only a shorter count.
+                    return match split_index(&data) {
+                        Some((count, _)) if count == next => Ok((key.0, total)),
+                        _ => Err(Error::TransferIncomplete),
+                    };
                 }
                 _ => {
                     inbox.pending.forget(key);

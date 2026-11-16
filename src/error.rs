@@ -24,6 +24,9 @@ pub enum Error {
     InvalidTarget(u32),
     /// The sender of a [`Stream`](crate::Stream) transfer gave up on it.
     TransferAborted,
+    /// A [`Stream`](crate::Stream) transfer arrived with pieces missing, so what was
+    /// written is not the whole transfer.
+    TransferIncomplete,
     /// A [`SharedRegion`](crate::SharedRegion) cannot have this size or offset.
     InvalidSize(usize),
     /// This plugin id is reserved for the library.
@@ -47,6 +50,7 @@ impl fmt::Display for Error {
             Error::UnknownNode(nick) => write!(f, "unknown node: {nick}"),
             Error::InvalidTarget(id) => write!(f, "{id:#x} is not a single node"),
             Error::TransferAborted => write!(f, "the sender aborted the transfer"),
+            Error::TransferIncomplete => write!(f, "the transfer arrived with pieces missing"),
             Error::InvalidSize(size) => write!(f, "invalid size: {size}"),
             Error::InvalidPluginId(id) => write!(f, "plugin id {id} is reserved"),
         }
