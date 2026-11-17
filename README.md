@@ -200,8 +200,8 @@ Outros pontos:
 - **Reiniciar na mesma porta:** depois que um servidor QUIC para, a porta fica ocupada enquanto
   as conexões antigas terminam, o que levou de 100 a 150 ms nos testes. Com TCP, ela fica livre
   na hora.
-- **Em outras partes:** `connect_retry_quic`. Ainda não há QUIC na API em C, no Python nem no
-  `render_wall`.
+- **Em outras partes:** `connect_retry_quic` e `--quic` no `render_wall`. Ainda não há QUIC na
+  API em C nem no Python.
 
 ### Comparação
 
@@ -312,6 +312,11 @@ maquina2$ cargo run --example render_wall -- node maquina1:9191
 maquina3$ cargo run --example render_wall -- node maquina1:9191
 ```
 
+Com `--sctp` no servidor e em cada nó, tudo passa por SCTP. Com QUIC, compile com
+`--features quic` e use `--quic`: o servidor mostra `node options: --quic --fingerprint ...`,
+que os nós recebem para aceitar só o certificado dele. `--any-certificate` no lugar de
+`--fingerprint` aceita qualquer certificado, sem proteção contra man in the middle.
+
 | Comando, em qualquer janela | Efeito, em todas |
 |---|---|
 | Setas, WASD ou arrastar com o mouse | Translação |
@@ -353,6 +358,17 @@ tudo isso em Linux, em um contêiner descartável com tela virtual:
 
 ```
 docker run --rm -v "${PWD}:/src:ro" -v "${PWD}/tests/render_wall/output:/out" rust:1 sh /src/tests/render_wall/run-linux.sh
+```
+
+**Teste em contêineres.** Põe o servidor e cada nó em um contêiner próprio, com tela virtual,
+ligados só por uma rede do Docker, e verifica a imagem dos tiles, a troca simultânea, um nó
+lento, um nó que entra e outro que morre, um nó congelado (`docker pause`) e uma rede com
+atraso e jitter. Os contêineres usam o relógio da máquina, então as diferenças de tempo
+medidas entre eles são reais:
+
+```
+docker build -f tests/render_wall/Dockerfile -t libglass-render-wall .
+python tests/render_wall/test_containers.py
 ```
 
 ## Limitações

@@ -16,7 +16,9 @@
 //! machine3$ cargo run --example render_wall -- node machine1:9191
 //! ```
 //!
-//! With `--sctp` on the server and on every node, everything goes through SCTP.
+//! With `--sctp` on the server and on every node, everything goes through SCTP. With
+//! `--features quic`, `--quic` does the same with QUIC: the server prints the
+//! fingerprint of its certificate, which the nodes get with `--fingerprint`.
 //!
 //! See `usage` below for the keys and the options, and `sync.rs` for how it works.
 
@@ -48,6 +50,10 @@ usage:
 
 options of all:
   --sctp            uses SCTP instead of TCP, in the server and in every node
+  --quic            uses QUIC, with --features quic; the server prints its fingerprint
+  --fingerprint HEX on a node with --quic, the fingerprint the server printed
+  --any-certificate on a node with --quic, accepts any certificate: no protection
+                    against a man in the middle
 
 server options:
   --wait-for N      does not start until N nodes have joined
@@ -142,18 +148,50 @@ impl Args {
     }
 }
 
-fn protocol(args: &mut Args) -> Protocol {
-    if args.flag("--sctp") {
-        Protocol::Sctp
-    } else {
-        Protocol::Tcp
+fn protocol(args: &mut Args, server: bool) -> Result<Protocol, BoxError> {
+    let sctp = args.flag("--sctp");
+    let quic = args.flag("--quic");
+    let fingerprint = args.text("--fingerprint")?;
+    let any_certificate = args.flag("--any-certificate");
+    if sctp && quic {
+        return Err("--sctp and --quic cannot be used together".into());
     }
+    if !quic && (fingerprint.is_some() || any_certificate) {
+        return Err("--fingerprint and --any-certificate need --quic".into());
+    }
+    if !quic {
+        return Ok(if sctp { Protocol::Sctp } else { Protocol::Tcp });
+    }
+    quic_protocol(server, fingerprint, any_certificate)
+}
+
+#[cfg(feature = "quic")]
+fn quic_protocol(
+    server: bool,
+    fingerprint: Option<String>,
+    any_certificate: bool,
+) -> Result<Protocol, BoxError> {
+    use libglass::QuicTrust;
+    let trust = match (fingerprint, any_certificate) {
+        (Some(_), true) => return Err("--fingerprint or --any-certificate, not both".into()),
+        (Some(text), false) => QuicTrust::Fingerprint(text.parse()?),
+        (None, true) => QuicTrust::AnyCertificate,
+        // The server replaces it by its own fingerprint.
+        (None, false) if server => QuicTrust::AnyCertificate,
+        (None, false) => return Err("a node with --quic needs --fingerprint".into()),
+    };
+    Ok(Protocol::Quic(trust))
+}
+
+#[cfg(not(feature = "quic"))]
+fn quic_protocol(_: bool, _: Option<String>, _: bool) -> Result<Protocol, BoxError> {
+    Err("--quic needs the example built with --features quic".into())
 }
 
 fn server_options(args: &mut Args) -> Result<Options, BoxError> {
     let defaults = Options::default();
     let options = Options {
-        protocol: protocol(args),
+        protocol: protocol(args, true)?,
         fps: args.value("--fps")?.unwrap_or(defaults.fps),
         fixed_step: args.value("--fixed-step")?,
         max_frames: args.value("--frames")?,
@@ -184,8 +222,14 @@ fn run_server(mut args: Args) -> Result<(), BoxError> {
     let options = server_options(&mut args)?;
     args.finish()?;
 
+    let mut options = options;
     let server = options.protocol.bind(&address)?;
+    options.protocol = options.protocol.for_clients_of(&server);
     println!("listening on {}", server.local_addr());
+    let node_args = options.protocol.node_args();
+    if node_args.len() > 1 {
+        println!("node options: {}", node_args.join(" "));
+    }
     coordinate(local_address(&server), &options)
 }
 
@@ -203,6 +247,7 @@ fn run_demo(mut args: Args) -> Result<(), BoxError> {
     args.finish()?;
 
     let server = options.protocol.bind("127.0.0.1:0")?;
+    options.protocol = options.protocol.for_clients_of(&server);
     let address = local_address(&server);
     println!("listening on {address}");
 
@@ -213,7 +258,7 @@ fn run_demo(mut args: Args) -> Result<(), BoxError> {
             Command::new(&program)
                 .args(["node", &address.to_string(), "--auto-place"])
                 .args(["--size", &format!("{width}x{height}")])
-                .args((options.protocol == Protocol::Sctp).then_some("--sctp"))
+                .args(options.protocol.node_args())
                 .spawn()?,
         );
     }
@@ -241,7 +286,7 @@ fn run_node_role(mut args: Args) -> Result<(), BoxError> {
         None => BTreeSet::new(),
     };
     let options = NodeOptions {
-        protocol: protocol(&mut args),
+        protocol: protocol(&mut args, false)?,
         size: args.pair("--size", 'x')?.unwrap_or(DEFAULT_SIZE),
         position: args.pair("--position", ',')?,
         auto_place: args.flag("--auto-place"),

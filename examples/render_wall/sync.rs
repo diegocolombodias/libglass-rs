@@ -19,6 +19,8 @@
 //! with a frame that it has not rendered. So it asks to join, and the coordinator, once
 //! the last frame has been released, holds the next one until the node is in the barrier.
 
+#[cfg(feature = "quic")]
+use libglass::QuicTrust;
 use libglass::{
     Barrier, Error, Event, GlassClient, GlassServer, Messenger, Mode, NodeId, Wire, EVERYBODY_ID,
 };
@@ -284,6 +286,10 @@ pub enum Protocol {
     #[default]
     Tcp,
     Sctp,
+    /// QUIC, with the certificate that the server must present. A server started with
+    /// any value here generates a new certificate, and its coordinator trusts only it.
+    #[cfg(feature = "quic")]
+    Quic(QuicTrust),
 }
 
 impl Protocol {
@@ -294,6 +300,8 @@ impl Protocol {
             Protocol::Sctp => Ok(GlassServer::bind_sctp(address)?),
             #[cfg(not(unix))]
             Protocol::Sctp => Err(NO_SCTP.into()),
+            #[cfg(feature = "quic")]
+            Protocol::Quic(_) => Ok(GlassServer::bind_quic(address)?),
         }
     }
 
@@ -310,6 +318,37 @@ impl Protocol {
             Protocol::Sctp => Ok(GlassClient::connect_retry_sctp(server, nickname, timeout)?),
             #[cfg(not(unix))]
             Protocol::Sctp => Err(NO_SCTP.into()),
+            #[cfg(feature = "quic")]
+            Protocol::Quic(trust) => Ok(GlassClient::connect_retry_quic(
+                server, nickname, trust, timeout,
+            )?),
+        }
+    }
+
+    /// The protocol for the clients of `server`: with QUIC, they trust only its
+    /// certificate.
+    pub fn for_clients_of(self, server: &GlassServer) -> Protocol {
+        #[cfg(feature = "quic")]
+        if let (Protocol::Quic(_), Some(fingerprint)) = (self, server.quic_fingerprint()) {
+            return Protocol::Quic(QuicTrust::Fingerprint(fingerprint));
+        }
+        let _ = server;
+        self
+    }
+
+    /// The options that give this protocol to a node.
+    pub fn node_args(self) -> Vec<String> {
+        match self {
+            Protocol::Tcp => vec![],
+            Protocol::Sctp => vec!["--sctp".into()],
+            #[cfg(feature = "quic")]
+            Protocol::Quic(QuicTrust::Fingerprint(fingerprint)) => {
+                vec!["--quic".into(), "--fingerprint".into(), fingerprint.to_string()]
+            }
+            #[cfg(feature = "quic")]
+            Protocol::Quic(QuicTrust::AnyCertificate) => {
+                vec!["--quic".into(), "--any-certificate".into()]
+            }
         }
     }
 }
@@ -717,6 +756,45 @@ mod tests {
         assert!(seen.iter().all(|frames| frames == &seen[0]));
         assert!(seen[0].last().unwrap().time > 1.9);
         assert!(seen[0].iter().any(|state| state.offset != [0.0, 0.0]));
+    }
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn all_nodes_see_the_same_frames_over_quic() {
+        let protocol = Protocol::Quic(libglass::QuicTrust::AnyCertificate);
+        let server = protocol.bind("127.0.0.1:0").unwrap();
+        let protocol = protocol.for_clients_of(&server);
+        assert!(matches!(
+            protocol,
+            Protocol::Quic(libglass::QuicTrust::Fingerprint(_))
+        ));
+        let addr = server.local_addr();
+        let options = Options {
+            max_frames: Some(100),
+            wait_for: 3,
+            autopilot: true,
+            fixed_step: Some(0.01),
+            protocol,
+            ..fast()
+        };
+        let coordinator = thread::spawn(move || coordinate(addr, &options).unwrap());
+        let rendered = Rendered::default();
+        let nodes: Vec<_> = (0..3)
+            .map(|i| {
+                let rendered = rendered.clone();
+                thread::spawn(move || {
+                    let link = NodeLink::join(addr, protocol, &format!("q{i}")).unwrap();
+                    play(&link, &rendered, &[])
+                })
+            })
+            .collect();
+        let seen: Vec<Vec<FrameState>> = nodes.into_iter().map(|n| n.join().unwrap()).collect();
+        coordinator.join().unwrap();
+        drop(server);
+
+        assert_eq!(seen[0].len(), 99);
+        assert_consecutive(&seen[0]);
+        assert!(seen.iter().all(|frames| frames == &seen[0]));
     }
 
     #[test]
