@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 650" width="760" height="650" role="img" aria-labelledby="title desc" font-family="Liberation Sans, Arial, Helvetica, sans-serif" font-size="15">
-  <title id="title">Arquitetura modularizada da Glass em Rust</title>
-  <desc id="desc">Um ambiente virtual 3D colaborativo roda sobre um motor gráfico com OpenGL, que usa a Glass pelas interfaces em Rust, em C ou em Python. O arcabouço tem a instanciação (servidor-cliente, mestre-escravo, ponto-a-ponto com peers e gateways, e reconexão automática), os protocolos (TCP, UDP, SCTP, QUIC e Unix socket) e os plugins (eventos, barreiras, compartilhamento, aliases, variáveis remotas, mensagens, fluxos de dados, eventos serializáveis, memória compartilhada e plugins próprios). Em cinza, o que é novo na versão em Rust: a API em C, a reconexão automática e o QUIC.</desc>
+  <title id="title">Modular architecture of Glass in Rust</title>
+  <desc id="desc">A collaborative 3D virtual environment runs on a graphics engine with OpenGL, which uses Glass through its interfaces in Rust, C or Python. The framework has the instantiation (client-server, master-slave, peer-to-peer with peers and gateways, and automatic reconnection), the protocols (TCP, UDP, SCTP, QUIC and Unix sockets) and the plugins (events, barriers, sharing, aliases, remote variables, messages, data streams, serializable events, shared memory and custom plugins). In grey, what is new in the Rust version: the C API, automatic reconnection and QUIC.</desc>
   <style>
     .layer { fill: #ffffff; stroke: #000000; stroke-width: 1.2; }
     .group { fill: #ffffff; stroke: #000000; stroke-width: 1.2; }
@@ -13,41 +13,41 @@
 
   <!-- Layers above the framework -->
   <rect class="layer" x="10" y="10" width="740" height="42" rx="16"/>
-  <text class="center" x="380" y="36">Ambiente Virtual 3D Colaborativo</text>
+  <text class="center" x="380" y="36">Collaborative 3D Virtual Environment</text>
 
   <rect class="layer" x="10" y="64" width="740" height="42" rx="16"/>
-  <text class="center" x="380" y="90">Motor de Jogo / Motor Gráfico / OpenGL</text>
+  <text class="center" x="380" y="90">Game Engine / Graphics Engine / OpenGL</text>
 
   <rect class="layer" x="10" y="118" width="740" height="60" rx="16"/>
   <text x="24" y="153">Interfaces</text>
   <rect class="item" x="130" y="128" width="190" height="40" rx="6"/>
   <text class="center" x="225" y="153">Rust</text>
   <rect class="new" x="340" y="128" width="190" height="40" rx="6"/>
-  <text class="center" x="435" y="153">API em C</text>
+  <text class="center" x="435" y="153">C API</text>
   <rect class="item" x="550" y="128" width="190" height="40" rx="6"/>
   <text class="center" x="645" y="153">Python</text>
 
   <!-- Framework -->
   <rect class="layer" x="10" y="190" width="740" height="414" rx="16"/>
-  <text x="24" y="210">Arcabouço</text>
+  <text x="24" y="210">Framework</text>
 
   <!-- Instantiation -->
   <rect class="group" x="28" y="222" width="342" height="166" rx="4"/>
-  <text x="38" y="241">Instanciação</text>
+  <text x="38" y="241">Instantiation</text>
   <rect class="item" x="44" y="252" width="150" height="46" rx="6"/>
-  <text class="center" x="119" y="271">Servidor</text>
-  <text class="center" x="119" y="289">Cliente</text>
+  <text class="center" x="119" y="271">Client</text>
+  <text class="center" x="119" y="289">Server</text>
   <rect class="item" x="206" y="252" width="148" height="46" rx="6"/>
-  <text class="center" x="280" y="271">Mestre</text>
-  <text class="center" x="280" y="289">Escravo</text>
+  <text class="center" x="280" y="271">Master</text>
+  <text class="center" x="280" y="289">Slave</text>
   <rect class="item" x="44" y="308" width="310" height="34" rx="6"/>
-  <text class="center" x="199" y="330">Ponto-a-Ponto (Peers e Gateways)</text>
+  <text class="center" x="199" y="330">Peer-to-Peer (Peers and Gateways)</text>
   <rect class="new" x="44" y="350" width="310" height="28" rx="6"/>
-  <text class="center" x="199" y="369">Reconexão Automática</text>
+  <text class="center" x="199" y="369">Automatic Reconnection</text>
 
   <!-- Protocols -->
   <rect class="group" x="28" y="400" width="342" height="190" rx="4"/>
-  <text x="38" y="419">Protocolos</text>
+  <text x="38" y="419">Protocols</text>
   <rect class="item" x="44" y="432" width="94" height="62" rx="4"/>
   <text class="center" x="91" y="468">TCP</text>
   <rect class="item" x="152" y="432" width="94" height="62" rx="4"/>
@@ -64,37 +64,37 @@
   <text x="398" y="241">Plugins</text>
   <g>
     <rect class="item" x="404" y="254" width="152" height="52" rx="4"/>
-    <text class="center" x="480" y="285">Eventos</text>
+    <text class="center" x="480" y="285">Events</text>
     <rect class="item" x="570" y="254" width="152" height="52" rx="4"/>
-    <text class="center" x="646" y="285">Barreiras</text>
+    <text class="center" x="646" y="285">Barriers</text>
 
     <rect class="item" x="404" y="320" width="152" height="52" rx="4"/>
-    <text class="center" x="480" y="351">Compartilhamento</text>
+    <text class="center" x="480" y="351">Sharing</text>
     <rect class="item" x="570" y="320" width="152" height="52" rx="4"/>
     <text class="center" x="646" y="351">Aliases</text>
 
     <rect class="item" x="404" y="386" width="152" height="52" rx="4"/>
-    <text class="center" x="480" y="408">Variáveis</text>
-    <text class="center" x="480" y="426">Remotas</text>
+    <text class="center" x="480" y="408">Remote</text>
+    <text class="center" x="480" y="426">Variables</text>
     <rect class="item" x="570" y="386" width="152" height="52" rx="4"/>
-    <text class="center" x="646" y="417">Mensagens</text>
+    <text class="center" x="646" y="417">Messages</text>
 
     <rect class="item" x="404" y="452" width="152" height="52" rx="4"/>
-    <text class="center" x="480" y="474">Fluxos</text>
-    <text class="center" x="480" y="492">de Dados</text>
+    <text class="center" x="480" y="474">Data</text>
+    <text class="center" x="480" y="492">Streams</text>
     <rect class="item" x="570" y="452" width="152" height="52" rx="4"/>
-    <text class="center" x="646" y="474">Eventos</text>
-    <text class="center" x="646" y="492">Serializáveis</text>
+    <text class="center" x="646" y="474">Serializable</text>
+    <text class="center" x="646" y="492">Events</text>
 
     <rect class="item" x="404" y="518" width="152" height="52" rx="4"/>
-    <text class="center" x="480" y="540">Memória</text>
-    <text class="center" x="480" y="558">Compartilhada</text>
+    <text class="center" x="480" y="540">Shared</text>
+    <text class="center" x="480" y="558">Memory</text>
     <rect class="item" x="570" y="518" width="152" height="52" rx="4"/>
-    <text class="center" x="646" y="540">Plugins</text>
-    <text class="center" x="646" y="558">Próprios</text>
+    <text class="center" x="646" y="540">Custom</text>
+    <text class="center" x="646" y="558">Plugins</text>
   </g>
 
   <!-- Legend -->
   <rect class="new" x="12" y="620" width="22" height="16" rx="3"/>
-  <text x="44" y="633" font-size="14">Novo na versão em Rust</text>
+  <text x="44" y="633" font-size="14">New in the Rust version</text>
 </svg>

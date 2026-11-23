@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 830" width="1040" height="830" role="img" aria-labelledby="title desc" font-family="Segoe UI, Helvetica, Arial, sans-serif">
-  <title id="title">Arquitetura da libglass</title>
-  <desc id="desc">Cada nó tem um GlassClient com objetos distribuídos, que troca pacotes por TCP, SCTP, Unix socket ou UDP com um GlassServer. O envio acontece na thread de quem chama. No servidor, threads de leitura colocam os pacotes em uma fila, e uma única thread dispatcher os entrega aos plugins e envia as respostas. Um peer se liga aos peers do seu grupo, e um gateway também aos gateways de outros grupos.</desc>
+  <title id="title">Architecture of libglass</title>
+  <desc id="desc">Each node has a GlassClient with distributed objects, which exchanges packets with a GlassServer through TCP, SCTP, QUIC, Unix sockets or UDP. A client sends in the thread of the caller. In the server, reading threads put the packets in a queue, and a single dispatcher thread hands them to the plugins; each connection has a queue and a thread that writes to it. A peer links to the peers of its group, and a gateway also to the gateways of other groups.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="#475569"/>
@@ -26,22 +26,22 @@
 
   <!-- Applications -->
   <rect class="app" x="30" y="20" width="320" height="52" rx="6"/>
-  <text class="name" x="190" y="42">Aplicação em C ou Python</text>
-  <text class="sub" x="190" y="60">pela API em C, sem Stream nem EventSerializable</text>
+  <text class="name" x="190" y="42">Application in C or Python</text>
+  <text class="sub" x="190" y="60">through the C API, without Stream or EventSerializable</text>
   <rect class="app" x="370" y="20" width="320" height="52" rx="6"/>
-  <text class="name" x="530" y="42">Aplicação em Rust</text>
-  <text class="sub" x="530" y="60">usa os objetos diretamente</text>
+  <text class="name" x="530" y="42">Application in Rust</text>
+  <text class="sub" x="530" y="60">uses the objects directly</text>
   <path class="line" marker-end="url(#arrow)" d="M190 72 V100"/>
   <path class="line" marker-end="url(#arrow)" d="M530 72 V100"/>
 
   <rect class="app" x="720" y="20" width="290" height="52" rx="6"/>
   <text class="name" x="865" y="42">SharedRegion</text>
-  <text class="sub" x="865" y="60">memória na mesma máquina, sem rede</text>
+  <text class="sub" x="865" y="60">memory on the same machine, no network</text>
   <path class="line" marker-end="url(#arrow)" d="M690 46 H720"/>
 
   <!-- Client -->
   <rect class="client" x="30" y="100" width="660" height="240" rx="8"/>
-  <text class="title" x="46" y="124">GlassClient: um em cada nó</text>
+  <text class="title" x="46" y="124">GlassClient: one in each node</text>
 
   <g>
     <rect class="box" x="46" y="136" width="98" height="32" rx="4"/><text class="name" x="95" y="157">Event</text>
@@ -50,12 +50,12 @@
     <rect class="box" x="358" y="136" width="98" height="32" rx="4"/><text class="name" x="407" y="157">Remote</text>
     <rect class="box" x="462" y="136" width="98" height="32" rx="4"/><text class="name" x="511" y="157">Barrier</text>
     <rect class="box" x="566" y="136" width="98" height="32" rx="4"/><text class="name" x="615" y="157">Alias</text>
-    <rect class="box" x="46" y="174" width="305" height="28" rx="4"/><text class="sub" x="198" y="193">EventSerializable, construído sobre Event</text>
-    <rect class="box" x="359" y="174" width="305" height="28" rx="4"/><text class="sub" x="511" y="193">Stream, construído sobre Messenger</text>
+    <rect class="box" x="46" y="174" width="305" height="28" rx="4"/><text class="sub" x="198" y="193">EventSerializable, built on Event</text>
+    <rect class="box" x="359" y="174" width="305" height="28" rx="4"/><text class="sub" x="511" y="193">Stream, built on Messenger</text>
   </g>
 
   <rect class="box" x="254" y="226" width="410" height="32" rx="4"/>
-  <text class="name" x="459" y="247">Estado do cliente, com um Mutex e um Condvar</text>
+  <text class="name" x="459" y="247">State of the client, with a Mutex and a Condvar</text>
 
   <path class="line" marker-end="url(#arrow)" d="M141 202 V226"/>
   <path class="line" marker-end="url(#arrow)" d="M459 226 V202"/>
@@ -63,40 +63,40 @@
   <path class="line" marker-end="url(#arrow)" d="M563 278 V258"/>
 
   <rect class="box" x="46" y="226" width="190" height="98" rx="4"/>
-  <text class="name" x="141" y="268">Envio</text>
-  <text class="sub" x="141" y="286">na thread de quem chama</text>
+  <text class="name" x="141" y="268">Sending</text>
+  <text class="sub" x="141" y="286">in the thread of the caller</text>
   <rect class="box" x="254" y="278" width="190" height="46" rx="4"/>
   <text class="name" x="349" y="297">UDP</text>
-  <text class="sub" x="349" y="314">opcional; uma thread lê</text>
+  <text class="sub" x="349" y="314">optional; a thread reads</text>
   <rect class="box" x="462" y="278" width="202" height="46" rx="4"/>
-  <text class="name" x="563" y="297">Thread de leitura</text>
-  <text class="sub" x="563" y="314">guarda ou entrega o que chega</text>
+  <text class="name" x="563" y="297">Reading thread</text>
+  <text class="sub" x="563" y="314">keeps or delivers what arrives</text>
 
   <!-- Server -->
   <rect class="server" x="30" y="450" width="660" height="360" rx="8"/>
   <text class="title" x="46" y="474">GlassServer</text>
 
   <rect class="box" x="46" y="486" width="190" height="56" rx="4"/>
-  <text class="name" x="141" y="509">Threads de leitura</text>
-  <text class="sub" x="141" y="527">uma por conexão</text>
+  <text class="name" x="141" y="509">Reading threads</text>
+  <text class="sub" x="141" y="527">one per connection</text>
   <rect class="box" x="254" y="486" width="190" height="56" rx="4"/>
   <text class="name" x="349" y="509">UDP</text>
-  <text class="sub" x="349" y="527">opcional; uma thread lê</text>
+  <text class="sub" x="349" y="527">optional; a thread reads</text>
   <rect class="box" x="462" y="486" width="202" height="56" rx="4"/>
-  <text class="name" x="563" y="509">Envio</text>
-  <text class="sub" x="563" y="527">uma fila e uma thread por conexão</text>
+  <text class="name" x="563" y="509">Sending</text>
+  <text class="sub" x="563" y="527">queue + thread per connection</text>
 
   <path class="line" marker-end="url(#arrow)" d="M141 542 V564"/>
   <path class="line" marker-end="url(#arrow)" d="M349 542 V564"/>
 
   <rect class="box" x="46" y="564" width="398" height="44" rx="4"/>
-  <text class="name" x="245" y="591">Fila única: tudo o que chega, em ordem</text>
+  <text class="name" x="245" y="591">Single queue: everything that arrives, in order</text>
 
   <path class="line" marker-end="url(#arrow)" d="M245 608 V634"/>
   <path class="line" marker-end="url(#arrow)" d="M563 634 V542"/>
 
   <rect class="dispatcher" x="46" y="634" width="618" height="160" rx="6"/>
-  <text class="name" x="355" y="658">Thread dispatcher: a única dona do estado dos plugins</text>
+  <text class="name" x="355" y="658">Dispatcher thread: the only owner of the state of the plugins</text>
   <g>
     <rect class="box" x="60" y="670" width="140" height="32" rx="4"/><text class="name" x="130" y="691">Root</text>
     <rect class="box" x="208" y="670" width="140" height="32" rx="4"/><text class="name" x="278" y="691">Alias</text>
@@ -105,50 +105,50 @@
     <rect class="box" x="60" y="710" width="140" height="32" rx="4"/><text class="name" x="130" y="731">Event</text>
     <rect class="box" x="208" y="710" width="140" height="32" rx="4"/><text class="name" x="278" y="731">Remote</text>
     <rect class="box" x="356" y="710" width="140" height="32" rx="4"/><text class="name" x="426" y="731">Messenger</text>
-    <rect class="box" x="504" y="710" width="146" height="32" rx="4"/><text class="name" x="577" y="731">Seus plugins</text>
+    <rect class="box" x="504" y="710" width="146" height="32" rx="4"/><text class="name" x="577" y="731">Your plugins</text>
   </g>
-  <text class="sub" x="355" y="772">Cada objeto do cliente conversa com o plugin de mesmo nome no servidor</text>
+  <text class="sub" x="355" y="772">Each object of a client talks to the plugin of the same name in the server</text>
 
   <!-- Transports -->
   <path class="line" marker-end="url(#arrow)" d="M141 324 V486"/>
   <path class="line dashed" marker-start="url(#arrow)" marker-end="url(#arrow)" d="M349 324 V486"/>
   <path class="line" marker-end="url(#arrow)" d="M563 486 V324"/>
-  <rect x="56" y="395" width="170" height="22" fill="#ffffff"/>
-  <text class="label" x="141" y="410">TCP, SCTP ou Unix socket</text>
+  <rect x="36" y="395" width="210" height="22" fill="#ffffff"/>
+  <text class="label" x="141" y="410">TCP, SCTP, QUIC or Unix socket</text>
   <rect x="274" y="387" width="150" height="38" fill="#ffffff"/>
-  <text class="label" x="349" y="402">UDP: mais rápido,</text>
-  <text class="label" x="349" y="418">pode perder pacotes</text>
-  <rect x="478" y="395" width="170" height="22" fill="#ffffff"/>
-  <text class="label" x="563" y="410">TCP, SCTP ou Unix socket</text>
+  <text class="label" x="349" y="402">UDP: faster,</text>
+  <text class="label" x="349" y="418">may lose packets</text>
+  <rect x="458" y="395" width="210" height="22" fill="#ffffff"/>
+  <text class="label" x="563" y="410">TCP, SCTP, QUIC or Unix socket</text>
 
   <!-- Other servers -->
   <rect x="720" y="100" width="290" height="240" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
-  <text class="title" x="736" y="124">O que cruza servidores</text>
-  <text class="note" x="736" y="146">Objetos com Mode::Global, mensagens de</text>
-  <text class="note" x="736" y="164">controle e plugins que pedirem.</text>
-  <text class="note" x="736" y="190" font-weight="600">Para qual servidor cada pacote segue:</text>
-  <text class="note" x="736" y="212">De um cliente: peers e gateways</text>
-  <text class="note" x="736" y="232">De um peer: gateways</text>
-  <text class="note" x="736" y="252">De um gateway: peers</text>
-  <text class="note" x="736" y="280">Cada nível só repassa ao outro,</text>
-  <text class="note" x="736" y="298">então os pacotes não dão voltas.</text>
-  <text class="note" x="736" y="324">Entre servidores: TCP ou SCTP.</text>
+  <text class="title" x="736" y="124">What crosses servers</text>
+  <text class="note" x="736" y="146">Objects with Mode::Global, control</text>
+  <text class="note" x="736" y="164">messages, and plugins that ask to.</text>
+  <text class="note" x="736" y="190" font-weight="600">Which servers each packet goes to:</text>
+  <text class="note" x="736" y="212">From a client: peers and gateways</text>
+  <text class="note" x="736" y="232">From a peer: gateways</text>
+  <text class="note" x="736" y="252">From a gateway: peers</text>
+  <text class="note" x="736" y="280">Each level only forwards to the other,</text>
+  <text class="note" x="736" y="298">so packets do not go in circles.</text>
+  <text class="note" x="736" y="324">Between servers: TCP, SCTP or QUIC.</text>
 
   <rect class="other" x="720" y="450" width="290" height="160" rx="8"/>
-  <text class="title" x="736" y="474">Mesmo grupo, se for um peer</text>
+  <text class="title" x="736" y="474">Same group, if it is a peer</text>
   <rect class="box" x="736" y="486" width="258" height="40" rx="4"/>
   <text class="name" x="865" y="511">GlassServer peer</text>
   <path class="line" marker-start="url(#arrow)" marker-end="url(#arrow)" d="M865 526 V556"/>
   <rect class="box" x="736" y="556" width="258" height="40" rx="4"/>
-  <text class="name" x="865" y="581">Os clientes dele</text>
+  <text class="name" x="865" y="581">Its clients</text>
 
   <rect class="other" x="720" y="634" width="290" height="176" rx="8"/>
-  <text class="title" x="736" y="658">Outro grupo, se for um gateway</text>
+  <text class="title" x="736" y="658">Other group, if it is a gateway</text>
   <rect class="box" x="736" y="670" width="258" height="40" rx="4"/>
   <text class="name" x="865" y="695">GlassServer gateway</text>
   <path class="line" marker-start="url(#arrow)" marker-end="url(#arrow)" d="M865 710 V740"/>
   <rect class="box" x="736" y="740" width="258" height="40" rx="4"/>
-  <text class="name" x="865" y="765">Os peers e clientes dele</text>
+  <text class="name" x="865" y="765">Its peers and clients</text>
 
   <path class="line" marker-start="url(#arrow)" marker-end="url(#arrow)" d="M690 508 H736"/>
   <path class="line" marker-start="url(#arrow)" marker-end="url(#arrow)" d="M690 692 H736"/>
